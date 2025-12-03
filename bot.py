@@ -356,9 +356,9 @@ async def admin_view(callback: types.CallbackQuery):
         return await callback.answer("Заявка не знайдена", show_alert=True)
 
     status = {
-        "new": "🟢 Нова",
-        "approved": "✔ Підтверджена",
-        "rejected": "❌ Відхилена",
+        "Нова": "🟢 Нова",
+        "Підтверджена": "✔ Підтверджена",
+        "Відхилена": "❌ Відхилена",
     }.get(req.status, req.status)
 
     text = (
@@ -580,12 +580,12 @@ async def step_car(message: types.Message, state: FSMContext):
     await state.update_data(car=car)
 
     kb = InlineKeyboardBuilder()
-    kb.button(text="📸 Завантажити документи", callback_data="photo_upload")
+    kb.button(text="📸 Завантажити фото документів", callback_data="photo_upload")
     kb.button(text="⏭ Пропустити", callback_data="photo_skip")
     kb.adjust(1)
 
     await message.answer(
-        "🔹 Завантажте документи або пропустіть:",
+        "🔹 Завантажте фото документів або пропустіть:",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
     )
 
@@ -942,7 +942,7 @@ async def adm_ok(callback: types.CallbackQuery):
 
     async with SessionLocal() as session:
         req = await session.get(Request, req_id)
-        req.status = "approved"
+        req.status = "Підтверджена"
         req.admin_id = callback.from_user.id
         await session.commit()
 
@@ -965,7 +965,7 @@ async def adm_rej(callback: types.CallbackQuery):
 
     async with SessionLocal() as session:
         req = await session.get(Request, req_id)
-        req.status = "rejected"
+        req.status = "Відхилено"
         req.admin_id = callback.from_user.id
         await session.commit()
 
