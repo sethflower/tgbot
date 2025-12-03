@@ -1,7 +1,8 @@
 ###############################################################
 #                      DRIVER QUEUE BOT                       #
-#                   Aiogram3 + Railway + PostgreSQL           #
-#                      Final Premium Version                  #
+#       Aiogram 3 • Railway Hosting • PostgreSQL (async)      #
+#                     FULL PROFESSIONAL EDITION               #
+#            Красивый интерфейс • Меню • Админ-панель         #
 ###############################################################
 
 import os
@@ -11,27 +12,35 @@ from datetime import datetime, date, timedelta
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import (
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
+)
 
 from sqlalchemy.ext.asyncio import (
-    create_async_engine, async_sessionmaker, AsyncSession
-)
-from sqlalchemy import (
-    Column, Integer, BigInteger, String, Boolean, Date, Text, TIMESTAMP,
-    select, delete
+    create_async_engine,
+    async_sessionmaker,
+    AsyncSession,
 )
 from sqlalchemy.orm import declarative_base
+from sqlalchemy import (
+    Column, Integer, BigInteger, String, Boolean,
+    Date, Text, TIMESTAMP, select, delete
+)
 
 from dotenv import load_dotenv
 
 ###############################################################
-#                     CONFIG & INITIALIZATION
+#                    LOAD ENVIRONMENT
 ###############################################################
 
 load_dotenv()
@@ -41,13 +50,17 @@ SUPERADMIN_ID = int(os.getenv("SUPERADMIN_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not all([BOT_TOKEN, SUPERADMIN_ID, DATABASE_URL]):
-    raise RuntimeError("Не встановлені BOT_TOKEN / SUPERADMIN_ID / DATABASE_URL")
+    raise RuntimeError("❌ ENV-переменные BOT_TOKEN / SUPERADMIN_ID / DATABASE_URL не установлены!")
 
-# исправляем обычный postgres://
+# Чиним неправильные префиксы postgres://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+###############################################################
+#                  LOGGING & BOT INITIALIZATION
+###############################################################
 
 logging.basicConfig(level=logging.INFO)
 
@@ -57,30 +70,33 @@ bot = Bot(
 )
 dp = Dispatcher()
 
+
 ###############################################################
-#                       DATABASE
+#                        DATABASE
 ###############################################################
 
 Base = declarative_base()
 
 class Admin(Base):
     __tablename__ = "admins"
+
     id = Column(Integer, primary_key=True)
-    telegram_id = Column(BigInteger, unique=True)
+    telegram_id = Column(BigInteger, unique=True, nullable=False)
     is_superadmin = Column(Boolean, default=False)
 
 
 class Request(Base):
     __tablename__ = "requests"
+
     id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger)
+    user_id = Column(BigInteger, nullable=False)
 
     supplier = Column(Text)
     driver_name = Column(Text)
     phone = Column(Text)
     car = Column(Text)
 
-    docs_file_id = Column(Text)
+    docs_file_id = Column(Text, nullable=True)
 
     loading_type = Column(Text)
     date = Column(Date)
@@ -90,10 +106,11 @@ class Request(Base):
 
     status = Column(String, default="new")
     admin_id = Column(BigInteger, nullable=True)
-    admin_comment = Column(Text)
+
 
 engine = create_async_engine(DATABASE_URL, echo=False)
-SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
 
 async def init_db():
     async with engine.begin() as conn:
@@ -101,7 +118,41 @@ async def init_db():
 
 
 ###############################################################
-#                       FSM STATES
+#                     CONSTANTS & MENUS
+###############################################################
+
+BACK_TEXT = "⬅ Назад"
+
+def back_keyboard(enabled=True):
+    if not enabled:
+        return ReplyKeyboardRemove()
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BACK_TEXT)]],
+        resize_keyboard=True
+    )
+
+def main_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="▶️ Створити заявку", callback_data="menu_new")
+    kb.button(text="📋 Мій список заявок", callback_data="menu_my")
+    kb.button(text="⚙️ Адмін-панель", callback_data="menu_admin")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def admin_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🆕 Нові заявки", callback_data="admin_new")
+    kb.button(text="📚 Усі заявки", callback_data="admin_all")
+    kb.button(text="➕ Додати адміна", callback_data="admin_add")
+    kb.button(text="➖ Видалити адміна", callback_data="admin_remove")
+    kb.button(text="🗑 Очистити БД", callback_data="admin_clear")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+###############################################################
+#                        FSM STATES
 ###############################################################
 
 class QueueForm(StatesGroup):
@@ -114,7 +165,6 @@ class QueueForm(StatesGroup):
     calendar = State()
     hour = State()
     minute = State()
-    preview = State()
 
 
 class AdminChangeForm(StatesGroup):
@@ -124,52 +174,402 @@ class AdminChangeForm(StatesGroup):
 
 
 ###############################################################
-#                       HELPERS
+#                 START → BEAUTIFUL RED CARD
 ###############################################################
 
-async def get_admins():
+@dp.message(CommandStart())
+async def start(message: types.Message, state: FSMContext):
+    await state.clear()
+    
+    text = (
+        "🟥 <b>DC Link — Електронна черга водіїв</b>\n\n"
+        "👋 Вітаємо у електронній черзі водіїв DC Link!\n"
+        "Цей бот допоможе створити заявку на вивантаження.\n\n"
+        "Натисніть кнопку нижче щоб почати."
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="▶️ Створити заявку", callback_data="menu_new")
+    kb.button(text="📋 Мій список заявок", callback_data="menu_my")
+    kb.button(text="⚙️ Адмін-панель", callback_data="menu_admin")
+    kb.adjust(1)
+
+    await message.answer(text, reply_markup=kb.as_markup())
+
+
+###############################################################
+#                     MAIN MENU HANDLERS
+###############################################################
+
+@dp.callback_query(F.data == "menu_new")
+async def menu_new(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer(
+        "🔹 Введіть постачальника:",
+        reply_markup=back_keyboard(False)
+    )
+    await state.set_state(QueueForm.supplier)
+
+
+@dp.callback_query(F.data == "menu_my")
+async def menu_my(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+
     async with SessionLocal() as session:
-        result = await session.execute(select(Admin))
-        return result.scalars().all()
+        result = await session.execute(
+            select(Request).where(Request.user_id == user_id).order_by(Request.id.desc()).limit(10)
+        )
+        rows = result.scalars().all()
+
+    if not rows:
+        return await callback.message.answer("У вас немає заявок.")
+
+    text = "<b>📋 Ваші останні 10 заявок:</b>\n\n"
+    for req in rows:
+        text += f"• <b>#{req.id}</b> — {req.date.strftime('%d.%m.%Y')} {req.time} — {req.status}\n"
+
+    await callback.message.answer(text)
 
 
-async def notify_all_admins(text, exclude=None):
-    admins = await get_admins()
-    for adm in admins:
-        if exclude and adm.telegram_id == exclude:
-            continue
-        try:
-            await bot.send_message(adm.telegram_id, text)
-        except:
-            pass
+@dp.callback_query(F.data == "menu_admin")
+async def menu_admin(callback: types.CallbackQuery):
+    if callback.from_user.id != SUPERADMIN_ID:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(Admin).where(Admin.telegram_id == callback.from_user.id)
+            )
+            admin = result.scalar_one_or_none()
+            if not admin:
+                return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
+
+    await callback.message.answer("⚙️ <b>Адмін-панель:</b>", reply_markup=admin_menu())
 
 
 ###############################################################
-#                 INLINE CALENDARS & TIME PICKERS
+#                ADMIN — NEW REQUESTS LIST
 ###############################################################
 
-def build_calendar(year=None, month=None):
+@dp.callback_query(F.data == "admin_new")
+async def admin_new(callback: types.CallbackQuery):
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Request).where(Request.status == "new").order_by(Request.id.desc())
+        )
+        rows = result.scalars().all()
+
+    if not rows:
+        return await callback.message.answer("🟢 Немає нових заявок.")
+
+    text = "<b>🆕 Нові заявки:</b>\n\n"
+    for r in rows:
+        text += f"• <b>#{r.id}</b> — {r.date.strftime('%d.%m.%Y')} {r.time}\n"
+
+        await callback.message.answer(text)
+
+
+###############################################################
+#            ADMIN — LIST ALL REQUESTS (last 10)
+###############################################################
+
+@dp.callback_query(F.data == "admin_all")
+async def admin_all(callback: types.CallbackQuery):
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Request).order_by(Request.id.desc()).limit(10)
+        )
+        rows = result.scalars().all()
+
+    if not rows:
+        return await callback.message.answer("⚪ Немає заявок в історії.")
+
+    text = "<b>📚 Останні 10 заявок (нові → старі):</b>\n\n"
+    for r in rows:
+        text += (
+            f"• <b>#{r.id}</b> — "
+            f"{r.date.strftime('%d.%m.%Y')} {r.time} — "
+            f"{'🟢 NEW' if r.status=='new' else '⚪ ' + r.status}\n"
+        )
+
+    await callback.message.answer(text)
+
+
+###############################################################
+#             ADMIN — ADD ADMIN (interactive menu)
+###############################################################
+
+@dp.callback_query(F.data == "admin_add")
+async def admin_add(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer(
+        "➕ Введіть Telegram ID користувача, якого потрібно зробити адміном:",
+        reply_markup=back_keyboard()
+    )
+    await state.set_state("add_admin_wait_id")
+
+
+@dp.message(F.text, state="add_admin_wait_id")
+async def add_admin_wait_id(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.clear()
+        return await message.answer("Повертаємось.", reply_markup=ReplyKeyboardRemove())
+
+    try:
+        tg_id = int(message.text.strip())
+    except:
+        return await message.answer("❌ ID має бути числом. Спробуйте ще.")
+
+    async with SessionLocal() as session:
+        existing = await session.execute(
+            select(Admin).where(Admin.telegram_id == tg_id)
+        )
+        if existing.scalar_one_or_none():
+            await state.clear()
+            return await message.answer("⚠️ Цей користувач вже є адміністратором.")
+
+        session.add(Admin(telegram_id=tg_id, is_superadmin=False))
+        await session.commit()
+
+    await message.answer(f"✔ Користувач <code>{tg_id}</code> став адміністратором.", reply_markup=ReplyKeyboardRemove())
+    await state.clear()
+
+
+###############################################################
+#           ADMIN — REMOVE ADMIN (interactive menu)
+###############################################################
+
+@dp.callback_query(F.data == "admin_remove")
+async def admin_remove(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer(
+        "➖ Введіть Telegram ID користувача, якого потрібно видалити з адмінів:",
+        reply_markup=back_keyboard()
+    )
+    await state.set_state("remove_admin_wait_id")
+
+
+@dp.message(F.text, state="remove_admin_wait_id")
+async def remove_admin_wait_id(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.clear()
+        return await message.answer("Повертаємось.", reply_markup=ReplyKeyboardRemove())
+
+    try:
+        tg_id = int(message.text.strip())
+    except:
+        return await message.answer("❌ ID має бути числом.")
+
+    async with SessionLocal() as session:
+        await session.execute(
+            delete(Admin).where(Admin.telegram_id == tg_id)
+        )
+        await session.commit()
+
+    await message.answer(f"🗑 Адміністратора <code>{tg_id}</code> видалено.", reply_markup=ReplyKeyboardRemove())
+    await state.clear()
+
+
+###############################################################
+#                ADMIN — CLEAR DATABASE
+###############################################################
+
+@dp.callback_query(F.data == "admin_clear")
+async def admin_clear(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != SUPERADMIN_ID:
+        return await callback.answer("⛔ Тільки суперадмін!", show_alert=True)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗑 Очистити ВСІ заявки", callback_data="admin_clear_yes")
+    kb.button(text="❌ Скасувати", callback_data="admin_clear_no")
+    kb.adjust(1)
+
+    await callback.message.answer(
+        "⚠️ Ви точно хочете очистити ВСІ заявки у базі даних?",
+        reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "admin_clear_yes")
+async def admin_clear_yes(callback: types.CallbackQuery):
+    async with SessionLocal() as session:
+        await session.execute(delete(Request))
+        await session.commit()
+
+    await callback.message.answer("🗑 Усі заявки успішно видалено!")
+
+
+@dp.callback_query(F.data == "admin_clear_no")
+async def admin_clear_no(callback: types.CallbackQuery):
+    await callback.message.answer("Очищення скасовано.")
+
+
+###############################################################
+#                 DRIVER FORM — INPUT STEPS
+###############################################################
+
+@dp.message(QueueForm.supplier)
+async def step_supplier(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if not text:
+        return await message.answer("⚠ Введіть назву постачальника.")
+
+    await state.update_data(supplier=text)
+
+    await message.answer(
+        "🔹 Введіть ПІБ водія:",
+        reply_markup=back_keyboard()
+    )
+    await state.set_state(QueueForm.driver_name)
+
+
+@dp.message(QueueForm.driver_name)
+async def step_driver(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(QueueForm.supplier)
+        return await message.answer("🔹 Введіть постачальника:", reply_markup=back_keyboard(False))
+
+    text = message.text.strip()
+    if not text:
+        return await message.answer("⚠ Введіть ПІБ водія.")
+
+    await state.update_data(driver_name=text)
+
+    await message.answer(
+        "🔹 Введіть номер телефону:",
+        reply_markup=back_keyboard()
+    )
+    await state.set_state(QueueForm.phone)
+
+
+@dp.message(QueueForm.phone)
+async def step_phone(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(QueueForm.driver_name)
+        return await message.answer("🔹 Введіть ПІБ водія:", reply_markup=back_keyboard())
+
+    text = message.text.strip()
+    if not text:
+        return await message.answer("⚠ Введіть номер телефону.")
+
+    await state.update_data(phone=text)
+
+    await message.answer(
+        "🔹 Введіть марку і номер авто:",
+        reply_markup=back_keyboard()
+    )
+    await state.set_state(QueueForm.car)
+
+
+@dp.message(QueueForm.car)
+async def step_car(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(QueueForm.phone)
+        return await message.answer("🔹 Введіть номер телефону:", reply_markup=back_keyboard())
+
+    text = message.text.strip()
+    if not text:
+        return await message.answer("⚠ Введіть марку і номер авто.")
+
+    await state.update_data(car=text)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📸 Завантажити документи", callback_data="photo_upload")
+    kb.button(text="⏭ Пропустити", callback_data="photo_skip")
+    kb.adjust(1)
+
+    await message.answer(
+        "🔹 Завантажте фото документів або пропустіть:",
+        reply_markup=kb.as_markup()
+    )
+    await state.set_state(QueueForm.docs)
+
+
+###############################################################
+#                DOCUMENT UPLOAD
+###############################################################
+
+@dp.callback_query(QueueForm.docs, F.data == "photo_upload")
+async def photo_upload(callback: types.CallbackQuery):
+    await callback.message.answer("📸 Надішліть фото документів.")
+
+
+@dp.message(QueueForm.docs, F.photo)
+async def photo_received(message: types.Message, state: FSMContext):
+    file_id = message.photo[-1].file_id
+    await state.update_data(docs_file_id=file_id)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏭ Далі", callback_data="photo_done")
+    kb.adjust(1)
+
+    await message.answer("Фото збережено.", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(QueueForm.docs, F.data == "photo_skip")
+@dp.callback_query(QueueForm.docs, F.data == "photo_done")
+async def photo_done(callback: types.CallbackQuery, state: FSMContext):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📦 На палетах", callback_data="type_pal")
+    kb.button(text="🧱 В розсип", callback_data="type_loose")
+    kb.adjust(1)
+
+    await callback.message.answer(
+        "🔹 Оберіть тип завантаження:",
+        reply_markup=kb.as_markup()
+    )
+    await state.set_state(QueueForm.loading_type)
+
+
+###############################################################
+#                 LOADING TYPE → DATE
+###############################################################
+
+@dp.callback_query(QueueForm.loading_type)
+async def step_loading(callback: types.CallbackQuery, state: FSMContext):
+    if callback.data == "type_pal":
+        t = "Палети"
+    elif callback.data == "type_loose":
+        t = "Розсип"
+    else:
+        return await callback.answer("Невідомий варіант!")
+
+    await state.update_data(loading_type=t)
+
+    await callback.message.answer(
+        "🔹 Оберіть дату:",
+        reply_markup=build_date_calendar()
+    )
+    await state.set_state(QueueForm.calendar)
+
+
+###############################################################
+#                INLINE CALENDAR GENERATOR
+###############################################################
+
+def build_date_calendar(year=None, month=None):
     now = datetime.now()
     year = year or now.year
     month = month or now.month
 
     kb = InlineKeyboardBuilder()
-    kb.row(types.InlineKeyboardButton(text=f"📅 {datetime(year, month, 1).strftime('%B %Y')}", callback_data="ignore"))
+
+    month_name = datetime(year, month, 1).strftime("%B %Y")
+    kb.row(InlineKeyboardButton(text=f"📅 {month_name}", callback_data="ignore"))
 
     kb.row(*[
-        types.InlineKeyboardButton(text=x, callback_data="ignore")
-        for x in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+        InlineKeyboardButton(text=d, callback_data="ignore")
+        for d in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
     ])
 
-    start_wd = datetime(year, month, 1).weekday()
-    if start_wd != 0:
-        kb.row(*[types.InlineKeyboardButton(text=" ", callback_data="ignore")] * start_wd)
+    first = datetime(year, month, 1).weekday()
+    if first != 0:
+        kb.row(*[
+            InlineKeyboardButton(text=" ", callback_data="ignore")
+            for _ in range(first)
+        ])
 
     days = (datetime(year + (month == 12), (month % 12) + 1, 1) - timedelta(days=1)).day
 
     row = []
     for d in range(1, days + 1):
-        row.append(types.InlineKeyboardButton(text=str(d), callback_data=f"cal_day_{year}_{month}_{d}"))
+        row.append(InlineKeyboardButton(text=str(d), callback_data=f"day_{year}_{month}_{d}"))
         if len(row) == 7:
             kb.row(*row)
             row = []
@@ -178,234 +578,77 @@ def build_calendar(year=None, month=None):
 
     prev_m = month - 1 or 12
     prev_y = year - 1 if month == 1 else year
+
     next_m = month + 1 if month < 12 else 1
     next_y = year + 1 if month == 12 else year
 
     kb.row(
-        types.InlineKeyboardButton(text="⬅", callback_data=f"cal_prev_{prev_y}_{prev_m}"),
-        types.InlineKeyboardButton(text="Закрити", callback_data="cal_close"),
-        types.InlineKeyboardButton(text="➡", callback_data=f"cal_next_{next_y}_{next_m}")
+        InlineKeyboardButton(text="⬅", callback_data=f"prev_{prev_y}_{prev_m}"),
+        InlineKeyboardButton(text="Закрити", callback_data="close_calendar"),
+        InlineKeyboardButton(text="➡", callback_data=f"next_{next_y}_{next_m}")
     )
 
     return kb.as_markup()
 
 
-def build_hour_keyboard():
+###############################################################
+#       DRIVER — DATE / HOUR / MINUTE SELECTION
+###############################################################
+
+@dp.callback_query(QueueForm.calendar, F.data.startswith("prev_"))
+async def cal_prev(callback: types.CallbackQuery):
+    _, y, m = callback.data.split("_")
+    await callback.message.edit_reply_markup(reply_markup=build_date_calendar(int(y), int(m)))
+
+
+@dp.callback_query(QueueForm.calendar, F.data.startswith("next_"))
+async def cal_next(callback: types.CallbackQuery):
+    _, y, m = callback.data.split("_")
+    await callback.message.edit_reply_markup(reply_markup=build_date_calendar(int(y), int(m)))
+
+
+@dp.callback_query(QueueForm.calendar, F.data.startswith("day_"))
+async def cal_day(callback: types.CallbackQuery, state: FSMContext):
+    _, y, m, d = callback.data.split("_")
+    chosen = date(int(y), int(m), int(d))
+
+    await state.update_data(date=chosen)
+
     kb = InlineKeyboardBuilder()
     for h in range(24):
         kb.button(text=f"{h:02d}", callback_data=f"hour_{h:02d}")
     kb.adjust(6)
-    return kb.as_markup()
+
+    await callback.message.answer(
+        "⏰ Оберіть годину:",
+        reply_markup=kb.as_markup()
+    )
+    await state.set_state(QueueForm.hour)
 
 
-def build_minute_keyboard():
+@dp.callback_query(QueueForm.calendar, F.data == "close_calendar")
+async def close_calendar(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("❌ Вибір дати скасовано.")
+
+
+@dp.callback_query(QueueForm.hour, F.data.startswith("hour_"))
+async def hour_selected(callback: types.CallbackQuery, state: FSMContext):
+    h = callback.data.replace("hour_", "")
+    await state.update_data(hour=h)
+
     kb = InlineKeyboardBuilder()
     for m in range(0, 60, 5):
         kb.button(text=f"{m:02d}", callback_data=f"min_{m:02d}")
     kb.adjust(6)
-    return kb.as_markup()
 
-
-###############################################################
-#                       MAIN MENU
-###############################################################
-
-def main_menu(is_admin=False, is_super=False):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📄 Створити заявку", callback_data="new_request")
-
-    if is_admin:
-        kb.button(text="🆕 Нові заявки", callback_data="admin_new")
-        kb.button(text="📋 Всі заявки", callback_data="admin_all")
-
-    if is_super:
-        kb.button(text="➕ Додати адміна", callback_data="adm_add")
-        kb.button(text="➖ Видалити адміна", callback_data="adm_delete")
-        kb.button(text="🗑 Очистити БД", callback_data="adm_clear")
-
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-###############################################################
-#                       START
-###############################################################
-
-@dp.message(CommandStart())
-async def start(message: types.Message, state: FSMContext):
-    await state.clear()
-
-    admins = await get_admins()
-    is_admin = any(a.telegram_id == message.from_user.id for a in admins)
-    is_super = any(a.telegram_id == message.from_user.id and a.is_superadmin for a in admins)
-
-    await message.answer(
-        "Вітаю! Оберіть дію:",
-        reply_markup=main_menu(is_admin, is_super)
-    )
-
-
-###############################################################
-#                   CREATE REQUEST — STEP 1
-###############################################################
-
-@dp.callback_query(F.data == "new_request")
-async def new_req(callback, state):
-    await state.clear()
-    await callback.message.answer("🔹 Введіть постачальника:")
-    await state.set_state(QueueForm.supplier)
-
-
-@dp.message(QueueForm.supplier)
-async def step_supplier(msg, state):
-    await state.update_data(supplier=msg.text)
-    await msg.answer("🔹 Введіть ПІБ водія:")
-    await state.set_state(QueueForm.driver_name)
-
-
-@dp.message(QueueForm.driver_name)
-async def step_driver(msg, state):
-    await state.update_data(driver_name=msg.text)
-    await msg.answer("🔹 Введіть телефон:")
-    await state.set_state(QueueForm.phone)
-
-
-@dp.message(QueueForm.phone)
-async def step_phone(msg, state):
-    await state.update_data(phone=msg.text)
-    await msg.answer("🔹 Введіть марку та номер авто:")
-    await state.set_state(QueueForm.car)
-
-
-@dp.message(QueueForm.car)
-async def step_car(msg, state):
-    await state.update_data(car=msg.text)
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📸 Завантажити фото", callback_data="photo_upload")
-    kb.button(text="⏭ Пропустити", callback_data="photo_skip")
-    kb.adjust(1)
-
-    await msg.answer("🔹 Завантажте фото документів або пропустіть:", reply_markup=kb.as_markup())
-    await state.set_state(QueueForm.docs)
-
-
-@dp.callback_query(QueueForm.docs, F.data == "photo_upload")
-async def ask_photo(callback):
-    await callback.message.answer("Надішліть фото документів.")
-
-
-@dp.message(QueueForm.docs, F.photo)
-async def got_photo(msg, state):
-    await state.update_data(docs_file_id=msg.photo[-1].file_id)
-    await ask_loading_type(msg, state)
-
-
-@dp.callback_query(QueueForm.docs, F.data == "photo_skip")
-async def skip_photo(callback, state):
-    await state.update_data(docs_file_id=None)
-    await ask_loading_type(callback.message, state)
-
-
-async def ask_loading_type(msg, state):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📦 На палетах", callback_data="load_pal")
-    kb.button(text="🧱 В розсип", callback_data="load_loose")
-    kb.adjust(1)
-
-    await msg.answer("🔹 Оберіть тип завантаження:", reply_markup=kb.as_markup())
-    await state.set_state(QueueForm.loading_type)
-
-
-@dp.callback_query(QueueForm.loading_type)
-async def step_load(callback, state):
-    loading = "Палети" if callback.data == "load_pal" else "Розсип"
-    await state.update_data(loading_type=loading)
-
-    await callback.message.answer("🔹 Оберіть дату:", reply_markup=build_calendar())
-    await state.set_state(QueueForm.calendar)
-
-
-###############################################################
-#                   CALENDAR + TIME
-###############################################################
-
-@dp.callback_query(QueueForm.calendar, F.data.startswith("cal_prev_"))
-async def cal_prev(callback):
-    _, _, y, m = callback.data.split("_")
-    await callback.message.edit_reply_markup(build_calendar(int(y), int(m)))
-
-
-@dp.callback_query(QueueForm.calendar, F.data.startswith("cal_next_"))
-async def cal_next(callback):
-    _, _, y, m = callback.data.split("_")
-    await callback.message.edit_reply_markup(build_calendar(int(y), int(m)))
-
-
-@dp.callback_query(QueueForm.calendar, F.data.startswith("cal_day_"))
-async def cal_day(callback, state):
-    _, _, y, m, d = callback.data.split("_")
-    dt = date(int(y), int(m), int(d))
-    await state.update_data(date=dt)
-
-    await callback.message.answer("⏰ Оберіть годину:", reply_markup=build_hour_keyboard())
-    await state.set_state(QueueForm.hour)
-
-
-@dp.callback_query(QueueForm.calendar, F.data == "cal_close")
-async def cancel_calendar(callback, state):
-    await state.clear()
-    await callback.message.answer("❌ Створення заявки скасовано.")
-
-
-@dp.callback_query(QueueForm.hour, F.data.startswith("hour_"))
-async def pick_hour(callback, state):
-    await state.update_data(hour=callback.data.replace("hour_", ""))
-    await callback.message.answer("🕒 Оберіть хвилини:", reply_markup=build_minute_keyboard())
+    await callback.message.answer("🕒 Оберіть хвилини:", reply_markup=kb.as_markup())
     await state.set_state(QueueForm.minute)
 
 
 @dp.callback_query(QueueForm.minute, F.data.startswith("min_"))
-async def pick_min(callback, state):
+async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
     minute = callback.data.replace("min_", "")
-    await state.update_data(minute=minute)
-
-    data = await state.get_data()
-
-    # формируем предпросмотр
-    text = (
-        "<b>🔍 Перевірте дані перед відправкою:</b>\n\n"
-        f"🏢 Постачальник: <b>{data['supplier']}</b>\n"
-        f"👤 Водій: <b>{data['driver_name']}</b>\n"
-        f"📞 Телефон: <b>{data['phone']}</b>\n"
-        f"🚚 Авто: <b>{data['car']}</b>\n"
-        f"🧱 Завантаження: <b>{data['loading_type']}</b>\n"
-        f"🗓 Дата: <b>{data['date'].strftime('%d.%m.%Y')}</b>\n"
-        f"⏰ Час: <b>{data['hour']}:{data['minute']}</b>\n"
-    )
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📨 Відправити адмінам", callback_data="send_final")
-    kb.button(text="⬅ Редагувати", callback_data="edit_restart")
-    kb.adjust(1)
-
-    await callback.message.answer(text, reply_markup=kb.as_markup())
-    await state.set_state(QueueForm.preview)
-
-
-###############################################################
-#                 PREVIEW → SUBMIT
-###############################################################
-
-@dp.callback_query(QueueForm.preview, F.data == "edit_restart")
-async def edit_restart(callback, state):
-    await state.clear()
-    await callback.message.answer("🔄 Почнемо знову. Введіть постачальника:")
-    await state.set_state(QueueForm.supplier)
-
-
-@dp.callback_query(QueueForm.preview, F.data == "send_final")
-async def send_final(callback, state):
     data = await state.get_data()
 
     async with SessionLocal() as session:
@@ -418,293 +661,124 @@ async def send_final(callback, state):
             docs_file_id=data.get("docs_file_id"),
             loading_type=data["loading_type"],
             date=data["date"],
-            time=f"{data['hour']}:{data['minute']}",
-            status="new",
-            created_at=datetime.utcnow()
+            time=f"{data['hour']}:{minute}",
+            created_at=datetime.utcnow(),
+            status="new"
         )
         session.add(req)
         await session.commit()
         await session.refresh(req)
 
-    await send_request_to_admins(req)
+    await broadcast_new_request(req.id)
 
-    await callback.message.answer("✅ Заявку відправлено!")
+    await callback.message.answer(
+        f"✅ Заявку #{req.id} відправлено адміністратору!\n"
+        f"👤 {req.driver_name}\n"
+        f"📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}"
+    )
+
     await state.clear()
 
 
 ###############################################################
-#               SEND TO ADMINS
+#       SEND REQUEST TO ALL ADMINS (AND NOTIFICATIONS)
 ###############################################################
 
-async def send_request_to_admins(req):
-    admins = await get_admins()
-    if not admins:
-        return
+async def broadcast_new_request(req_id: int):
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
 
-    text = (
-        f"<b>📦 Нова заявка #{req.id}</b>\n\n"
-        f"🏢 Постачальник: {req.supplier}\n"
-        f"👤 Водій: {req.driver_name}\n"
-        f"📞 Телефон: {req.phone}\n"
-        f"🚚 Авто: {req.car}\n"
-        f"🧱 Завантаження: {req.loading_type}\n"
-        f"🗓 Дата: {req.date.strftime('%d.%m.%Y')}\n"
-        f"⏰ Час: {req.time}\n"
+        admins = (await session.execute(select(Admin))).scalars().all()
+
+        text = (
+            f"<b>📦 Нова заявка #{req.id}</b>\n\n"
+            f"🏢 <b>Постачальник:</b> {req.supplier}\n"
+            f"👤 <b>Водій:</b> {req.driver_name}\n"
+            f"📞 <b>Телефон:</b> {req.phone}\n"
+            f"🚚 <b>Авто:</b> {req.car}\n"
+            f"🧱 <b>Тип:</b> {req.loading_type}\n"
+            f"📅 <b>Дата:</b> {req.date.strftime('%d.%m.%Y')}\n"
+            f"⏰ <b>Час:</b> {req.time}\n"
+        )
+
+        for a in admins:
+            kb = InlineKeyboardBuilder()
+            kb.button(text="✔ Підтвердити", callback_data=f"adm_ok_{req.id}")
+            kb.button(text="🔁 Змінити дату/час", callback_data=f"adm_change_{req.id}")
+            kb.button(text="❌ Відхилити", callback_data=f"adm_rej_{req.id}")
+            kb.adjust(1)
+
+            try:
+                await bot.send_message(a.telegram_id, text, reply_markup=kb.as_markup())
+                if req.docs_file_id:
+                    await bot.send_photo(a.telegram_id, req.docs_file_id)
+            except:
+                pass
+
+
+###############################################################
+#          ADMIN APPROVE / REJECT / CHANGE DATE-TIME
+###############################################################
+
+@dp.callback_query(F.data.startswith("adm_ok_"))
+async def adm_ok(callback: types.CallbackQuery):
+    req_id = int(callback.data.split("_")[2])
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        req.status = "approved"
+        req.admin_id = callback.from_user.id
+        await session.commit()
+
+    await callback.message.answer("✔ Підтверджено!")
+
+    # уведомить водителя
+    await bot.send_message(
+        req.user_id,
+        f"🎉 <b>Заявка #{req.id} підтверджена!</b>\n📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}"
     )
 
-    for adm in admins:
-        kb = InlineKeyboardBuilder()
-        kb.button(text="✔ Підтвердити", callback_data=f"adm_ok_{req.id}")
-        kb.button(text="🔁 Змінити", callback_data=f"adm_change_{req.id}")
-        kb.button(text="❌ Відхилити", callback_data=f"adm_rej_{req.id}")
-        kb.adjust(1)
+    # уведомить всех админов
+    await notify_admins_about_action(req, "підтверджена")
 
+
+@dp.callback_query(F.data.startswith("adm_rej_"))
+async def adm_rej(callback: types.CallbackQuery):
+    req_id = int(callback.data.split("_")[2])
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        req.status = "rejected"
+        req.admin_id = callback.from_user.id
+        await session.commit()
+
+    await callback.message.answer("❌ Відхилено!")
+
+    await bot.send_message(req.user_id, f"❌ <b>Заявку #{req.id} відхилено адміністратором.</b>")
+
+    await notify_admins_about_action(req, "відхилена")
+
+
+async def notify_admins_about_action(req: Request, action: str):
+    async with SessionLocal() as session:
+        admins = (await session.execute(select(Admin))).scalars().all()
+
+    text = (
+        f"ℹ️ <b>Заявка #{req.id} {action}</b>\n\n"
+        f"📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}\n"
+        f"👤 {req.driver_name}\n"
+        f"🏢 {req.supplier}"
+    )
+
+    for a in admins:
         try:
-            await bot.send_message(adm.telegram_id, text, reply_markup=kb.as_markup())
-            if req.docs_file_id:
-                await bot.send_photo(adm.telegram_id, req.docs_file_id)
+            await bot.send_message(a.telegram_id, text)
         except:
             pass
 
 
 ###############################################################
-#               ADMIN PANEL — LISTS
-###############################################################
-
-@dp.callback_query(F.data == "admin_new")
-async def admin_new(callback):
-    async with SessionLocal() as session:
-        result = await session.execute(select(Request).where(Request.status == "new"))
-        rows = result.scalars().all()
-
-    if not rows:
-        await callback.message.answer("🟢 Немає нових заявок.")
-        return
-
-    kb = InlineKeyboardBuilder()
-    for r in rows:
-        kb.button(text=f"🆕 Заявка #{r.id}", callback_data=f"view_{r.id}")
-    kb.adjust(1)
-
-    await callback.message.answer("🔽 Нові заявки:", reply_markup=kb.as_markup())
-
-
-@dp.callback_query(F.data == "admin_all")
-async def admin_all(callback):
-    async with SessionLocal() as session:
-        result = await session.execute(select(Request).order_by(Request.id.desc()))
-        rows = result.scalars().all()
-
-    if not rows:
-        await callback.message.answer("Поки заявок немає.")
-        return
-
-    kb = InlineKeyboardBuilder()
-    for r in rows:
-        status = "🆕" if r.status == "new" else "✔" if r.status == "approved" else "❌"
-        kb.button(text=f"{status} #{r.id}", callback_data=f"view_{r.id}")
-    kb.adjust(1)
-
-    await callback.message.answer("🔽 Всі заявки:", reply_markup=kb.as_markup())
-
-
-###############################################################
-#               VIEW REQUEST DETAILS
-###############################################################
-
-@dp.callback_query(F.data.startswith("view_"))
-async def view_request(callback):
-    req_id = int(callback.data.split("_")[1])
-
-    async with SessionLocal() as session:
-        req = await session.get(Request, req_id)
-
-    if not req:
-        await callback.message.answer("Заявку не знайдено.")
-        return
-
-    text = (
-        f"<b>Заявка #{req.id}</b>\n\n"
-        f"🏢 Постачальник: {req.supplier}\n"
-        f"👤 Водій: {req.driver_name}\n"
-        f"📞 Телефон: {req.phone}\n"
-        f"🚚 Авто: {req.car}\n"
-        f"🧱 Завантаження: {req.loading_type}\n"
-        f"🗓 Дата: {req.date.strftime('%d.%m.%Y')}\n"
-        f"⏰ Час: {req.time}\n"
-        f"📌 Статус: <b>{req.status}</b>\n"
-    )
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✔ Підтвердити", callback_data=f"adm_ok_{req.id}")
-    kb.button(text="🔁 Змінити", callback_data=f"adm_change_{req.id}")
-    kb.button(text="❌ Відхилити", callback_data=f"adm_rej_{req.id}")
-    kb.adjust(1)
-
-    await callback.message.answer(text, reply_markup=kb.as_markup())
-
-    if req.docs_file_id:
-        await callback.message.answer("📄 Документи:")
-        await bot.send_photo(callback.from_user.id, req.docs_file_id)
-
-
-###############################################################
-#               ADMIN ACTIONS: APPROVE / REJECT
-###############################################################
-
-@dp.callback_query(F.data.startswith("adm_ok_"))
-async def adm_ok(callback):
-    req_id = int(callback.data.split("_")[2])
-
-    async with SessionLocal() as session:
-        req = await session.get(Request, req_id)
-        if not req:
-            await callback.answer("Заявка не знайдена.")
-            return
-
-        req.status = "approved"
-        req.admin_id = callback.from_user.id
-        await session.commit()
-
-    await callback.message.answer("✔ Заявку підтверджено.")
-    await bot.send_message(req.user_id, f"🎉 Ваша заявка #{req_id} підтверджена!")
-
-    await notify_all_admins(f"ℹ️ Адмін {callback.from_user.id} підтвердив заявку #{req_id}", exclude=callback.from_user.id)
-
-
-@dp.callback_query(F.data.startswith("adm_rej_"))
-async def adm_rej(callback):
-    req_id = int(callback.data.split("_")[2])
-
-    async with SessionLocal() as session:
-        req = await session.get(Request, req_id)
-        if not req:
-            await callback.answer("Заявка не знайдена.")
-            return
-
-        req.status = "rejected"
-        req.admin_id = callback.from_user.id
-        await session.commit()
-
-    await callback.message.answer("❌ Заявку відхилено.")
-    await bot.send_message(req.user_id, f"❗ Вашу заявку #{req_id} відхилено.")
-
-    await notify_all_admins(f"ℹ️ Адмін {callback.from_user.id} відхилив заявку #{req_id}", exclude=callback.from_user.id)
-
-
-###############################################################
-#               ADMIN CHANGE DATE/TIME
-###############################################################
-
-@dp.callback_query(F.data.startswith("adm_change_"))
-async def adm_change(callback, state):
-    req_id = int(callback.data.split("_")[2])
-    await state.set_state(AdminChangeForm.calendar)
-    await state.update_data(req_id=req_id)
-
-    await callback.message.answer("🔄 Оберіть нову дату:", reply_markup=build_calendar())
-
-
-@dp.callback_query(AdminChangeForm.calendar, F.data.startswith("cal_prev_"))
-async def ac_prev(callback):
-    _, _, y, m = callback.data.split("_")
-    await callback.message.edit_reply_markup(build_calendar(int(y), int(m)))
-
-
-@dp.callback_query(AdminChangeForm.calendar, F.data.startswith("cal_next_"))
-async def ac_next(callback):
-    _, _, y, m = callback.data.split("_")
-    await callback.message.edit_reply_markup(build_calendar(int(y), int(m)))
-
-
-@dp.callback_query(AdminChangeForm.calendar, F.data.startswith("cal_day_"))
-async def ac_day(callback, state):
-    _, _, y, m, d = callback.data.split("_")
-    await state.update_data(new_date=date(int(y), int(m), int(d)))
-
-    await callback.message.answer("⏰ Оберіть годину:", reply_markup=build_hour_keyboard())
-    await state.set_state(AdminChangeForm.hour)
-
-
-@dp.callback_query(AdminChangeForm.hour, F.data.startswith("hour_"))
-async def ac_hour(callback, state):
-    await state.update_data(new_hour=callback.data.replace("hour_", ""))
-    await callback.message.answer("🕒 Оберіть хвилини:", reply_markup=build_minute_keyboard())
-    await state.set_state(AdminChangeForm.minute)
-
-
-@dp.callback_query(AdminChangeForm.minute, F.data.startswith("min_"))
-async def ac_min(callback, state):
-    minute = callback.data.replace("min_", "")
-    data = await state.get_data()
-
-    async with SessionLocal() as session:
-        req = await session.get(Request, data["req_id"])
-
-        req.date = data["new_date"]
-        req.time = f"{data['new_hour']}:{minute}"
-        req.status = "approved"
-        req.admin_id = callback.from_user.id
-        await session.commit()
-
-    await callback.message.answer("🔁 Дату/час оновлено.")
-    await bot.send_message(
-        req.user_id,
-        f"ℹ️ Заявка #{req.id} оновлена:\n"
-        f"🗓 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}"
-    )
-
-    await notify_all_admins(
-        f"ℹ️ Адмін {callback.from_user.id} змінив дату/час заявки #{req.id}",
-        exclude=callback.from_user.id
-    )
-
-    await state.clear()
-
-
-###############################################################
-#               SUPERADMIN — MANAGE ADMINS
-###############################################################
-
-@dp.callback_query(F.data == "adm_add")
-async def adm_add(callback, state):
-    await state.update_data(action="add_admin")
-    await callback.message.answer("Введіть Telegram ID користувача:")
-    await state.set_state(QueueForm.supplier)  # используем как временный ввод ID
-
-
-@dp.callback_query(F.data == "adm_delete")
-async def adm_delete(callback, state):
-    await state.update_data(action="del_admin")
-    await callback.message.answer("Введіть ID адміністратора для видалення:")
-    await state.set_state(QueueForm.supplier)
-
-
-@dp.callback_query(F.data == "adm_clear")
-async def adm_clear(callback):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🗑 Очистити ВСІ заявки", callback_data="clear_all")
-    kb.button(text="❌ Скасувати", callback_data="clear_cancel")
-    kb.adjust(1)
-    await callback.message.answer("Підтвердіть дію:", reply_markup=kb.as_markup())
-
-
-@dp.callback_query(F.data == "clear_all")
-async def clear_db(callback):
-    async with SessionLocal() as session:
-        await session.execute(delete(Request))
-        await session.commit()
-
-    await callback.message.answer("🗑 Всі заявки очищені.")
-
-
-@dp.callback_query(F.data == "clear_cancel")
-async def clear_cancel(callback):
-    await callback.message.answer("❌ Скасовано.")
-
-
-###############################################################
-#                     BOT START
+#                         BOT STARTUP
 ###############################################################
 
 async def main():
@@ -713,12 +787,12 @@ async def main():
     async with SessionLocal() as session:
         res = await session.execute(select(Admin).where(Admin.telegram_id == SUPERADMIN_ID))
         if not res.scalar_one_or_none():
-            sa = Admin(telegram_id=SUPERADMIN_ID, is_superadmin=True)
-            session.add(sa)
+            session.add(Admin(telegram_id=SUPERADMIN_ID, is_superadmin=True))
             await session.commit()
 
-    print("Bot started...")
+    print("Bot started!")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
