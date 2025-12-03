@@ -682,7 +682,7 @@ async def step_loading(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.answer(
         "🔹 Оберіть дату:",
-        reply_markup=build_date_calendar()
+        reply_markup=build_date_calendar(back_callback="back_to_loading")
     )
 
     await state.set_state(QueueForm.calendar)
@@ -692,7 +692,7 @@ async def step_loading(callback: types.CallbackQuery, state: FSMContext):
 #                INLINE CALENDAR GENERATOR                    
 ###############################################################
 
-def build_date_calendar(year=None, month=None):
+def build_date_calendar(year=None, month=None, back_callback: str | None = None):
     now = datetime.now()
     year = year or now.year
     month = month or now.month
@@ -747,10 +747,10 @@ def build_date_calendar(year=None, month=None):
         InlineKeyboardButton(text="➡", callback_data=f"next_{next_y}_{next_m}")
     )
 
-    kb.row(
-        InlineKeyboardButton(text=MAIN_MENU_TEXT, callback_data="go_main"),
-        InlineKeyboardButton(text=BACK_TEXT, callback_data="back_to_loading")
-    )
+    nav_row = [InlineKeyboardButton(text=MAIN_MENU_TEXT, callback_data="go_main")]
+    if back_callback:
+        nav_row.append(InlineKeyboardButton(text=BACK_TEXT, callback_data=back_callback))
+    kb.row(*nav_row)
 
     return kb.as_markup()
 
@@ -763,7 +763,7 @@ def build_date_calendar(year=None, month=None):
 async def cal_prev(callback: types.CallbackQuery):
     _, y, m = callback.data.split("_")
     await callback.message.edit_reply_markup(
-        reply_markup=build_date_calendar(int(y), int(m))
+        reply_markup=build_date_calendar(int(y), int(m), back_callback="back_to_loading")
     )
 
 
@@ -771,7 +771,7 @@ async def cal_prev(callback: types.CallbackQuery):
 async def cal_next(callback: types.CallbackQuery):
     _, y, m = callback.data.split("_")
     await callback.message.edit_reply_markup(
-        reply_markup=build_date_calendar(int(y), int(m))
+        reply_markup=build_date_calendar(int(y), int(m), back_callback="back_to_loading")
     )
 
 @dp.callback_query(QueueForm.calendar, F.data == "back_to_loading")
@@ -818,9 +818,13 @@ async def back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
     chosen_date: date | None = data.get("date")
 
     if chosen_date:
-        markup = build_date_calendar(chosen_date.year, chosen_date.month)
+        markup = build_date_calendar(
+            chosen_date.year,
+            chosen_date.month,
+            back_callback="back_to_loading"
+        )
     else:
-        markup = build_date_calendar()
+        markup = build_date_calendar(back_callback="back_to_loading")
 
     await state.set_state(QueueForm.calendar)
     await callback.message.answer("🔹 Оберіть дату:", reply_markup=markup)
@@ -986,7 +990,7 @@ async def adm_change(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.answer(
         "🔄 Оберіть нову дату:",
-        reply_markup=build_date_calendar()
+        reply_markup=build_date_calendar(back_callback="admin_change_back")
     )
     await state.set_state(AdminChangeForm.calendar)
 
@@ -995,7 +999,7 @@ async def adm_change(callback: types.CallbackQuery, state: FSMContext):
 async def adm_cal_prev(callback: types.CallbackQuery):
     _, y, m = callback.data.split("_")
     await callback.message.edit_reply_markup(
-        reply_markup=build_date_calendar(int(y), int(m))
+        reply_markup=build_date_calendar(int(y), int(m), back_callback="admin_change_back")
     )
 
 
@@ -1003,8 +1007,18 @@ async def adm_cal_prev(callback: types.CallbackQuery):
 async def adm_cal_next(callback: types.CallbackQuery):
     _, y, m = callback.data.split("_")
     await callback.message.edit_reply_markup(
-        reply_markup=build_date_calendar(int(y), int(m))
+        reply_markup=build_date_calendar(int(y), int(m), back_callback="admin_change_back")
     )
+
+
+@dp.callback_query(AdminChangeForm.calendar, F.data == "admin_change_back")
+async def adm_change_back(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer(
+        "Операцію зміни дати/часу скасовано.",
+        reply_markup=admin_menu()
+    )
+     await callback.answer()
 
 
 @dp.callback_query(AdminChangeForm.calendar, F.data.startswith("day_"))
@@ -1019,7 +1033,10 @@ async def adm_cal_day(callback: types.CallbackQuery, state: FSMContext):
         kb.button(text=f"{h:02d}", callback_data=f"ach_hour_{h:02d}")
     kb.adjust(6)
 
-    await callback.message.answer("⏰ Оберіть годину:", reply_markup=kb.as_markup())
+    await callback.message.answer(
+        "⏰ Оберіть годину:",
+        reply_markup=add_inline_navigation(kb, back_callback="admin_back_to_calendar").as_markup()
+    )
     await state.set_state(AdminChangeForm.hour)
 
 
@@ -1033,8 +1050,45 @@ async def adm_hour(callback: types.CallbackQuery, state: FSMContext):
         kb.button(text=f"{m:02d}", callback_data=f"ach_min_{m:02d}")
     kb.adjust(6)
 
-    await callback.message.answer("🕒 Оберіть хвилини:", reply_markup=kb.as_markup())
+    await callback.message.answer(
+        "🕒 Оберіть хвилини:",
+        reply_markup=add_inline_navigation(kb, back_callback="admin_back_to_hour").as_markup()
+    )
     await state.set_state(AdminChangeForm.minute)
+
+@dp.callback_query(AdminChangeForm.hour, F.data == "admin_back_to_calendar")
+async def admin_back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    chosen_date: date | None = data.get("new_date")
+
+    if chosen_date:
+        markup = build_date_calendar(
+            chosen_date.year,
+            chosen_date.month,
+            back_callback="admin_change_back"
+        )
+    else:
+        markup = build_date_calendar(back_callback="admin_change_back")
+
+    await state.set_state(AdminChangeForm.calendar)
+    await callback.message.answer("🔄 Оберіть нову дату:", reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(AdminChangeForm.minute, F.data == "admin_back_to_hour")
+async def admin_back_to_hour(callback: types.CallbackQuery, state: FSMContext):
+    kb = InlineKeyboardBuilder()
+    for h in range(24):
+        kb.button(text=f"{h:02d}", callback_data=f"ach_hour_{h:02d}")
+    kb.adjust(6)
+
+    await state.set_state(AdminChangeForm.hour)
+    await callback.message.answer(
+        "⏰ Оберіть годину:",
+        reply_markup=add_inline_navigation(kb, back_callback="admin_back_to_calendar").as_markup()
+    )
+    await callback.answer()
+
 
 
 @dp.callback_query(AdminChangeForm.minute, F.data.startswith("ach_min_"))
