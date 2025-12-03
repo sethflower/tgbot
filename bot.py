@@ -263,8 +263,8 @@ async def admin_new(callback: types.CallbackQuery):
     text = "<b>🆕 Нові заявки:</b>\n\n"
     for r in rows:
         text += f"• <b>#{r.id}</b> — {r.date.strftime('%d.%m.%Y')} {r.time}\n"
-
-        await callback.message.answer(text)
+    
+    await callback.message.answer(text)
 
 
 ###############################################################
