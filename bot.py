@@ -327,14 +327,69 @@ async def admin_all(callback: types.CallbackQuery):
         return await callback.message.answer("⚪ Немає заявок в базі.")
 
     text = "<b>📚 Останні 20 заявок:</b>\n\n"
+    kb = InlineKeyboardBuilder()
     for r in rows:
         status = "🟢 NEW" if r.status == "new" else f"⚪ {r.status}"
         text += (
             f"• <b>#{r.id}</b>  "
             f"{r.date.strftime('%d.%m.%Y')} {r.time}  —  {status}\n"
         )
+        kb.button(
+            text=f"#{r.id} — {r.date.strftime('%d.%m.%Y')} {r.time} ({r.status})",
+            callback_data=f"admin_view_{r.id}"
+        )
 
-    await callback.message.answer(text)
+    kb.button(text=MAIN_MENU_TEXT, callback_data="go_main")
+    kb.adjust(1)
+
+    await callback.message.answer(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data.startswith("admin_view_"))
+async def admin_view(callback: types.CallbackQuery):
+    req_id = int(callback.data.split("_")[2])
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+
+    if not req:
+        return await callback.answer("Заявка не знайдена", show_alert=True)
+
+    status = {
+        "new": "🟢 Нова",
+        "approved": "✔ Підтверджена",
+        "rejected": "❌ Відхилена",
+    }.get(req.status, req.status)
+
+    text = (
+        f"<b>📄 Заявка #{req.id}</b>\n"
+        f"Статус: {status}\n\n"
+        f"🏢 <b>Постачальник:</b> {req.supplier}\n"
+        f"👤 <b>Водій:</b> {req.driver_name}\n"
+        f"📞 <b>Телефон:</b> {req.phone}\n"
+        f"🚚 <b>Авто:</b> {req.car}\n"
+        f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
+        f"📅 <b>Дата:</b> {req.date.strftime('%d.%m.%Y')}\n"
+        f"⏰ <b>Час:</b> {req.time}"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✔ Підтвердити", callback_data=f"adm_ok_{req.id}")
+    kb.button(text="🔁 Змінити дату/час", callback_data=f"adm_change_{req.id}")
+    kb.button(text="❌ Відхилити", callback_data=f"adm_rej_{req.id}")
+    kb.button(text="⬅️ До списку", callback_data="admin_all")
+    kb.adjust(1)
+
+    if req.docs_file_id:
+        await callback.message.answer_photo(
+            req.docs_file_id,
+            caption=text,
+            reply_markup=kb.as_markup(),
+        )
+    else:
+        await callback.message.answer(text, reply_markup=kb.as_markup())
+
+    await callback.answer()
 ###############################################################
 #             ADMIN — ADD ADMIN (FSM Aiogram 3 OK)            
 ###############################################################
