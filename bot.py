@@ -120,15 +120,39 @@ async def init_db():
 #                     CONSTANTS & MENUS                       
 ###############################################################
 
-BACK_TEXT = "⬅ Назад"
+BACK_TEXT = "⬅️ Назад"
+MAIN_MENU_TEXT = "🏠 Головне меню"
 
-def back_keyboard(enabled=True):
-    if not enabled:
-        return ReplyKeyboardRemove()
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BACK_TEXT)]],
-        resize_keyboard=True
-    )
+
+def navigation_keyboard(include_back=True):
+    buttons = [[KeyboardButton(text=MAIN_MENU_TEXT)]]
+    if include_back:
+        buttons.append([KeyboardButton(text=BACK_TEXT)])
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+
+def add_inline_navigation(builder: InlineKeyboardBuilder, back_callback: str | None = None):
+    buttons = [InlineKeyboardButton(text=MAIN_MENU_TEXT, callback_data="go_main")]
+    if back_callback:
+        buttons.append(InlineKeyboardButton(text=BACK_TEXT, callback_data=back_callback))
+    builder.row(*buttons)
+    return builder
+
+
+async def show_main_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🏠 Ви у головному меню.", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Оберіть дію:", reply_markup=main_menu())
+
+
+@dp.message(F.text == MAIN_MENU_TEXT)
+async def handle_main_menu(message: types.Message, state: FSMContext):
+    await show_main_menu(message, state)
+
+@dp.callback_query(F.data == "go_main")
+async def handle_main_menu_callback(callback: types.CallbackQuery, state: FSMContext):
+    await show_main_menu(callback.message, state)
+    await callback.answer()
 
 def main_menu():
     kb = InlineKeyboardBuilder()
@@ -202,7 +226,7 @@ async def menu_new(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.answer(
         "🔹 Введіть постачальника:",
-        reply_markup=back_keyboard(False)
+        reply_markup=navigation_keyboard(include_back=False)
     )
 
     await state.set_state(QueueForm.supplier)
@@ -319,7 +343,7 @@ async def admin_all(callback: types.CallbackQuery):
 async def admin_add(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "➕ Введіть Telegram ID користувача:",
-        reply_markup=back_keyboard()
+        reply_markup=navigation_keyboard()
     )
     await state.set_state(AdminAdd.wait_id)
 
@@ -328,7 +352,9 @@ async def admin_add(callback: types.CallbackQuery, state: FSMContext):
 async def admin_add_wait(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.clear()
-        return await message.answer("Скасовано.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("Скасовано.", reply_markup=ReplyKeyboardRemove())
+        return await show_main_menu(message, state)
+
 
     try:
         tg_id = int(message.text)
@@ -359,7 +385,7 @@ async def admin_add_wait(message: types.Message, state: FSMContext):
 async def admin_remove(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "➖ Введіть Telegram ID адміністратора для видалення:",
-        reply_markup=back_keyboard()
+        reply_markup=navigation_keyboard()
     )
     await state.set_state(AdminRemove.wait_id)
 
@@ -368,7 +394,8 @@ async def admin_remove(callback: types.CallbackQuery, state: FSMContext):
 async def admin_remove_wait(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.clear()
-        return await message.answer("Скасовано.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("Скасовано.", reply_markup=ReplyKeyboardRemove())
+        return await show_main_menu(message, state)
 
     try:
         tg_id = int(message.text)
@@ -427,6 +454,9 @@ async def admin_clear_no(callback: types.CallbackQuery):
 
 @dp.message(QueueForm.supplier)
 async def step_supplier(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        return await message.answer("Ви на початку анкети. Користуйтеся кнопками нижче.")
+        
     supplier = message.text.strip()
 
     if not supplier:
@@ -436,7 +466,7 @@ async def step_supplier(message: types.Message, state: FSMContext):
 
     await message.answer(
         "🔹 Введіть ПІБ водія:",
-        reply_markup=back_keyboard()
+        reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.driver_name)
 
@@ -445,7 +475,10 @@ async def step_supplier(message: types.Message, state: FSMContext):
 async def step_driver_name(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.supplier)
-        return await message.answer("🔹 Введіть постачальника:")
+        return await message.answer(
+            "🔹 Введіть постачальника:",
+            reply_markup=navigation_keyboard(include_back=False)
+        )
 
     name = message.text.strip()
     if not name:
@@ -453,7 +486,7 @@ async def step_driver_name(message: types.Message, state: FSMContext):
 
     await state.update_data(driver_name=name)
 
-    await message.answer("🔹 Введіть номер телефону:", reply_markup=back_keyboard())
+    await message.answer("🔹 Введіть номер телефону:", reply_markup=navigation_keyboard())
     await state.set_state(QueueForm.phone)
 
 
@@ -461,7 +494,10 @@ async def step_driver_name(message: types.Message, state: FSMContext):
 async def step_phone(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.driver_name)
-        return await message.answer("🔹 Введіть ПІБ водія:")
+        return await message.answer(
+            "🔹 Введіть ПІБ водія:",
+            reply_markup=navigation_keyboard()
+        )
 
     phone = message.text.strip()
     if not phone:
@@ -469,7 +505,7 @@ async def step_phone(message: types.Message, state: FSMContext):
 
     await state.update_data(phone=phone)
 
-    await message.answer("🔹 Введіть марку і номер авто:", reply_markup=back_keyboard())
+    await message.answer("🔹 Введіть марку і номер авто:", reply_markup=navigation_keyboard())
     await state.set_state(QueueForm.car)
 
 
@@ -477,7 +513,10 @@ async def step_phone(message: types.Message, state: FSMContext):
 async def step_car(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.phone)
-        return await message.answer("🔹 Введіть номер телефону:")
+        return await message.answer(
+            "🔹 Введіть номер телефону:",
+            reply_markup=navigation_keyboard()
+        )
 
     car = message.text.strip()
     if not car:
@@ -492,7 +531,7 @@ async def step_car(message: types.Message, state: FSMContext):
 
     await message.answer(
         "🔹 Завантажте документи або пропустіть:",
-        reply_markup=kb.as_markup()
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
     )
 
     await state.set_state(QueueForm.docs)
@@ -504,6 +543,25 @@ async def step_car(message: types.Message, state: FSMContext):
 async def photo_upload(callback: types.CallbackQuery):
     await callback.message.answer("📸 Надішліть фото документів.")
 
+@dp.callback_query(QueueForm.docs, F.data == "back_to_car")
+async def back_to_car(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(QueueForm.car)
+    await callback.message.answer(
+        "🔹 Введіть марку і номер авто:",
+        reply_markup=navigation_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.message(QueueForm.docs, F.text == BACK_TEXT)
+async def docs_back(message: types.Message, state: FSMContext):
+    await state.set_state(QueueForm.car)
+    await message.answer(
+        "🔹 Введіть марку і номер авто:",
+        reply_markup=navigation_keyboard()
+    )
+
+
 
 @dp.message(QueueForm.docs, F.photo)
 async def photo_received(message: types.Message, state: FSMContext):
@@ -514,7 +572,10 @@ async def photo_received(message: types.Message, state: FSMContext):
     kb.button(text="⏭ Далі", callback_data="photo_done")
     kb.adjust(1)
 
-    await message.answer("Фото збережено.", reply_markup=kb.as_markup())
+    await message.answer(
+        "Фото збережено.",
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
+    )
 
 
 @dp.callback_query(QueueForm.docs, F.data == "photo_skip")
@@ -528,10 +589,25 @@ async def photo_done(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.answer(
         "🔹 Оберіть тип завантаження:",
-        reply_markup=kb.as_markup()
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_docs").as_markup()
     )
 
     await state.set_state(QueueForm.loading_type)
+
+@dp.callback_query(QueueForm.loading_type, F.data == "back_to_docs")
+async def loading_back(callback: types.CallbackQuery, state: FSMContext):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📸 Завантажити документи", callback_data="photo_upload")
+    kb.button(text="⏭ Пропустити", callback_data="photo_skip")
+    kb.adjust(1)
+
+    await state.set_state(QueueForm.docs)
+    await callback.message.answer(
+        "🔹 Завантажте документи або пропустіть:",
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
+    )
+    await callback.answer()
+
 
 
 ###############################################################
@@ -616,6 +692,11 @@ def build_date_calendar(year=None, month=None):
         InlineKeyboardButton(text="➡", callback_data=f"next_{next_y}_{next_m}")
     )
 
+    kb.row(
+        InlineKeyboardButton(text=MAIN_MENU_TEXT, callback_data="go_main"),
+        InlineKeyboardButton(text=BACK_TEXT, callback_data="back_to_loading")
+    )
+
     return kb.as_markup()
 
 
@@ -638,6 +719,19 @@ async def cal_next(callback: types.CallbackQuery):
         reply_markup=build_date_calendar(int(y), int(m))
     )
 
+@dp.callback_query(QueueForm.calendar, F.data == "back_to_loading")
+async def cal_back_to_loading(callback: types.CallbackQuery, state: FSMContext):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📦 На палетах", callback_data="type_pal")
+    kb.button(text="🧱 В розсип", callback_data="type_loose")
+    kb.adjust(1)
+
+    await state.set_state(QueueForm.loading_type)
+    await callback.message.answer(
+        "🔹 Оберіть тип завантаження:",
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_docs").as_markup()
+    )
+    await callback.answer()
 
 @dp.callback_query(QueueForm.calendar, F.data.startswith("day_"))
 async def cal_day(callback: types.CallbackQuery, state: FSMContext):
@@ -651,7 +745,10 @@ async def cal_day(callback: types.CallbackQuery, state: FSMContext):
         kb.button(text=f"{hour:02d}", callback_data=f"hour_{hour:02d}")
     kb.adjust(6)
 
-    await callback.message.answer("⏰ Оберіть годину:", reply_markup=kb.as_markup())
+    await callback.message.answer(
+        "⏰ Оберіть годину:",
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_calendar").as_markup()
+    )
     await state.set_state(QueueForm.hour)
 
 
@@ -659,6 +756,20 @@ async def cal_day(callback: types.CallbackQuery, state: FSMContext):
 async def close_calendar(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.answer("❌ Вибір дати скасовано.")
+
+@dp.callback_query(QueueForm.hour, F.data == "back_to_calendar")
+async def back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    chosen_date: date | None = data.get("date")
+
+    if chosen_date:
+        markup = build_date_calendar(chosen_date.year, chosen_date.month)
+    else:
+        markup = build_date_calendar()
+
+    await state.set_state(QueueForm.calendar)
+    await callback.message.answer("🔹 Оберіть дату:", reply_markup=markup)
+    await callback.answer()
 
 
 @dp.callback_query(QueueForm.hour, F.data.startswith("hour_"))
@@ -671,7 +782,10 @@ async def hour_selected(callback: types.CallbackQuery, state: FSMContext):
         kb.button(text=f"{m:02d}", callback_data=f"min_{m:02d}")
     kb.adjust(6)
 
-    await callback.message.answer("🕒 Оберіть хвилини:", reply_markup=kb.as_markup())
+    await callback.message.answer(
+        "🕒 Оберіть хвилини:",
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_hour").as_markup()
+    )
     await state.set_state(QueueForm.minute)
 
 
@@ -709,6 +823,21 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
     await broadcast_new_request(req.id)
 
     await state.clear()
+
+@dp.callback_query(QueueForm.minute, F.data == "back_to_hour")
+async def back_to_hour(callback: types.CallbackQuery, state: FSMContext):
+    kb = InlineKeyboardBuilder()
+    for hour in range(24):
+        kb.button(text=f"{hour:02d}", callback_data=f"hour_{hour:02d}")
+    kb.adjust(6)
+
+    await state.set_state(QueueForm.hour)
+    await callback.message.answer(
+        "⏰ Оберіть годину:",
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_calendar").as_markup()
+    )
+    await callback.answer()
+
 
 
 ###############################################################
