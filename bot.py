@@ -356,9 +356,9 @@ async def admin_view(callback: types.CallbackQuery):
         return await callback.answer("Заявка не знайдена", show_alert=True)
 
     status = {
-        "Нова": "🟢 Нова",
-        "Підтверджена": "✔ Підтверджена",
-        "Відхилена": "❌ Відхилена",
+        "new": "🟢 Нова",
+        "approved": "✔ Підтверджена",
+        "rejected": "❌ Відхилена",
     }.get(req.status, req.status)
 
     text = (
@@ -942,7 +942,7 @@ async def adm_ok(callback: types.CallbackQuery):
 
     async with SessionLocal() as session:
         req = await session.get(Request, req_id)
-        req.status = "Підтверджена"
+        req.status = "approved"
         req.admin_id = callback.from_user.id
         await session.commit()
 
@@ -965,7 +965,7 @@ async def adm_rej(callback: types.CallbackQuery):
 
     async with SessionLocal() as session:
         req = await session.get(Request, req_id)
-        req.status = "Відхилено"
+        req.status = "rejected"
         req.admin_id = callback.from_user.id
         await session.commit()
 
