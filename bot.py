@@ -198,6 +198,11 @@ class AdminChangeForm(StatesGroup):
     calendar = State()
     hour = State()
     minute = State()
+
+class UserDeleteForm(StatesGroup):
+    user_id = State()
+    reason = State()
+
 ###############################################################
 #                 START → BEAUTIFUL RED CARD                  
 ###############################################################
