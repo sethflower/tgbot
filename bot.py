@@ -241,22 +241,365 @@ async def menu_my(callback: types.CallbackQuery):
             select(Request)
             .where(Request.user_id == user_id)
             .order_by(Request.id.desc())
-            .limit(20)
+            .limit(3)
         )
         rows = result.scalars().all()
 
     if not rows:
         return await callback.message.answer("У вас немає заявок.")
 
-    text = "<b>📋 Ваші останні заявки:</b>\n\n"
+    text = "<b>📋 Ваші останні 3 заявки:</b>\n\n"
+    kb = InlineKeyboardBuilder()
     for req in rows:
+        status = get_status_label(req.status)
         text += (
             f"• <b>#{req.id}</b> — "
             f"{req.date.strftime('%d.%m.%Y')} {req.time} — "
-            f"{req.status}\n"
+            f"{status}\n"
+        )
+        kb.button(
+            text=f"#{req.id} ({req.date.strftime('%d.%m.%Y')} {req.time})",
+            callback_data=f"my_view_{req.id}"
         )
 
-    await callback.message.answer(text)
+    kb.button(text=MAIN_MENU_TEXT, callback_data="go_main")
+    kb.adjust(1)
+
+    await callback.message.answer(text, reply_markup=kb.as_markup())
+
+
+def get_status_label(status: str) -> str:
+    return {
+        "new": "🟢 Нова",
+        "approved": "✔ Підтверджена",
+        "rejected": "❌ Відхилена",
+        "deleted_by_user": "⛔ Видалена користувачем",
+    }.get(status, status)
+
+
+def format_request_text(req: Request) -> str:
+    status = get_status_label(req.status)
+    return (
+        f"<b>📄 Заявка #{req.id}</b>\n"
+        f"Статус: {status}\n\n"
+        f"🏢 <b>Постачальник:</b> {req.supplier}\n"
+        f"👤 <b>Водій:</b> {req.driver_name}\n"
+        f"📞 <b>Телефон:</b> {req.phone}\n"
+        f"🚚 <b>Авто:</b> {req.car}\n"
+        f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
+        f"📅 <b>Дата:</b> {req.date.strftime('%d.%m.%Y')}\n"
+        f"⏰ <b>Час:</b> {req.time}"
+    )
+
+
+def build_recent_request_ids(reqs: list[Request]) -> set[int]:
+    return {req.id for req in reqs}
+
+
+async def send_request_details(
+    req: Request,
+    callback_or_message: Union[types.CallbackQuery, types.Message],
+    *,
+    allow_actions: bool,
+    recent_ids: set[int] | None = None,
+):
+    kb = InlineKeyboardBuilder()
+    if allow_actions and req.id in (recent_ids or set()) and req.status != "deleted_by_user":
+        kb.button(text="✏️ Змінити", callback_data=f"my_edit_{req.id}")
+        kb.button(text="🗑 Видалити", callback_data=f"my_delete_{req.id}")
+    kb.button(text="⬅️ Мої заявки", callback_data="menu_my")
+    kb.button(text=MAIN_MENU_TEXT, callback_data="go_main")
+    kb.adjust(1)
+
+    text = format_request_text(req)
+
+    target_message = (
+        callback_or_message.message if isinstance(callback_or_message, types.CallbackQuery)
+        else callback_or_message
+    )
+
+    if req.docs_file_id:
+        await target_message.answer_photo(req.docs_file_id, caption=text, reply_markup=kb.as_markup())
+    else:
+        await target_message.answer(text, reply_markup=kb.as_markup())
+
+    if isinstance(callback_or_message, types.CallbackQuery):
+        await callback_or_message.answer()
+
+
+async def get_user_recent_requests(user_id: int) -> list[Request]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Request)
+            .where(Request.user_id == user_id)
+            .order_by(Request.id.desc())
+            .limit(3)
+        )
+        return result.scalars().all()
+
+
+@dp.callback_query(F.data.startswith("my_view_"))
+async def my_view(callback: types.CallbackQuery):
+    req_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+
+    if not req or req.user_id != user_id:
+        return await callback.answer("Заявка не знайдена", show_alert=True)
+
+    recent = await get_user_recent_requests(user_id)
+    await send_request_details(req, callback, allow_actions=True, recent_ids=build_recent_request_ids(recent))
+
+
+def is_request_recent(req_id: int, recent_ids: set[int]) -> bool:
+    return req_id in recent_ids
+
+
+@dp.callback_query(F.data.startswith("my_delete_"))
+async def my_delete(callback: types.CallbackQuery, state: FSMContext):
+    req_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
+    recent = await get_user_recent_requests(user_id)
+    recent_ids = build_recent_request_ids(recent)
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+
+    if not req or req.user_id != user_id:
+        return await callback.answer("Заявка не знайдена", show_alert=True)
+
+    if not is_request_recent(req_id, recent_ids):
+        return await callback.answer("Можна керувати лише останніми 3 заявками", show_alert=True)
+
+    if req.status == "deleted_by_user":
+        return await callback.answer("Заявка вже видалена", show_alert=True)
+
+    await state.set_state(UserDeleteForm.reason)
+    await state.update_data(req_id=req_id)
+    await callback.message.answer(
+        "Вкажіть причину видалення заявки:", reply_markup=navigation_keyboard(include_back=False)
+    )
+    await callback.answer()
+
+
+async def notify_admins_about_user_deletion(req: Request, reason: str):
+    async with SessionLocal() as session:
+        admins = (await session.execute(select(Admin))).scalars().all()
+
+    text = (
+        f"❗ Поставщик {req.supplier} видалив заявку #{req.id}\n"
+        f"Причина: {reason}\n\n"
+        f"📄 Дані заявки до видалення:\n"
+        f"👤 {req.driver_name}\n"
+        f"📞 {req.phone}\n"
+        f"🚚 {req.car}\n"
+        f"🧱 {req.loading_type}\n"
+        f"📅 {req.date.strftime('%d.%m.%Y')} ⏰ {req.time}"
+    )
+
+    for admin in admins:
+        try:
+            await bot.send_message(admin.telegram_id, text)
+        except:
+            pass
+
+
+@dp.message(UserDeleteForm.reason)
+async def my_delete_reason(message: types.Message, state: FSMContext):
+    reason = message.text.strip()
+    data = await state.get_data()
+    req_id = data.get("req_id")
+
+    if not reason:
+        return await message.answer("Причина не може бути порожньою.")
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.user_id != message.from_user.id:
+            await state.clear()
+            return await message.answer("Заявка не знайдена або вам не належить.")
+
+        req.status = "deleted_by_user"
+        await session.commit()
+
+    await notify_admins_about_user_deletion(req, reason)
+    await message.answer("Заявку видалено. Адміністратори отримали повідомлення.")
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("my_edit_"))
+async def my_edit(callback: types.CallbackQuery, state: FSMContext):
+    req_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
+    recent = await get_user_recent_requests(user_id)
+    recent_ids = build_recent_request_ids(recent)
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+
+    if not req or req.user_id != user_id:
+        return await callback.answer("Заявка не знайдена", show_alert=True)
+
+    if not is_request_recent(req_id, recent_ids):
+        return await callback.answer("Можна керувати лише останніми 3 заявками", show_alert=True)
+
+    if req.status == "deleted_by_user":
+        return await callback.answer("Заявка вже видалена", show_alert=True)
+
+    await state.set_state(UserEditForm.reason)
+    await state.update_data(req_id=req_id)
+    await callback.message.answer(
+        "Вкажіть причину зміни заявки:", reply_markup=navigation_keyboard(include_back=False)
+    )
+    await callback.answer()
+
+
+@dp.message(UserEditForm.reason)
+async def my_edit_reason(message: types.Message, state: FSMContext):
+    reason = message.text.strip()
+    data = await state.get_data()
+    req_id = data.get("req_id")
+
+    if not reason:
+        return await message.answer("Причина не може бути порожньою.")
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.user_id != message.from_user.id:
+            await state.clear()
+            return await message.answer("Заявка не знайдена або вам не належить.")
+
+    await state.update_data(reason=reason)
+    await state.set_state(UserEditForm.calendar)
+    await message.answer(
+        "Оберіть нову дату:",
+        reply_markup=build_date_calendar()
+    )
+
+
+@dp.callback_query(UserEditForm.calendar, F.data.startswith("prev_"))
+async def user_edit_prev(callback: types.CallbackQuery, state: FSMContext):
+    _, y, m = callback.data.split("_")
+    await callback.message.edit_reply_markup(reply_markup=build_date_calendar(int(y), int(m)))
+    await callback.answer()
+
+
+@dp.callback_query(UserEditForm.calendar, F.data.startswith("next_"))
+async def user_edit_next(callback: types.CallbackQuery, state: FSMContext):
+    _, y, m = callback.data.split("_")
+    await callback.message.edit_reply_markup(reply_markup=build_date_calendar(int(y), int(m)))
+    await callback.answer()
+
+
+@dp.callback_query(UserEditForm.calendar, F.data == "close_calendar")
+async def user_edit_cancel_calendar(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("Зміну заявки скасовано.")
+    await callback.answer()
+
+
+@dp.callback_query(UserEditForm.calendar, F.data.startswith("day_"))
+async def user_edit_day(callback: types.CallbackQuery, state: FSMContext):
+    _, y, m, d = callback.data.split("_")
+    chosen = date(int(y), int(m), int(d))
+
+    await state.update_data(new_date=chosen)
+
+    kb = InlineKeyboardBuilder()
+    for hour in range(24):
+        kb.button(text=f"{hour:02d}", callback_data=f"uhour_{hour:02d}")
+    kb.adjust(6)
+
+    await state.set_state(UserEditForm.hour)
+    await callback.message.answer(
+        "⏰ Оберіть годину:",
+        reply_markup=add_inline_navigation(kb, back_callback="edit_back_to_calendar").as_markup()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(UserEditForm.hour, F.data == "edit_back_to_calendar")
+async def user_edit_back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    chosen_date: date | None = data.get("new_date")
+
+    if chosen_date:
+        markup = build_date_calendar(chosen_date.year, chosen_date.month)
+    else:
+        markup = build_date_calendar()
+
+    await state.set_state(UserEditForm.calendar)
+    await callback.message.answer("Оберіть нову дату:", reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(UserEditForm.hour, F.data.startswith("uhour_"))
+async def user_edit_hour(callback: types.CallbackQuery, state: FSMContext):
+    hour = callback.data.replace("uhour_", "")
+    await state.update_data(new_hour=hour)
+
+    kb = InlineKeyboardBuilder()
+    for m in range(0, 60, 5):
+        kb.button(text=f"{m:02d}", callback_data=f"umin_{m:02d}")
+    kb.adjust(6)
+
+    await state.set_state(UserEditForm.minute)
+    await callback.message.answer(
+        "🕒 Оберіть хвилини:",
+        reply_markup=add_inline_navigation(kb, back_callback="edit_back_to_hour").as_markup()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(UserEditForm.minute, F.data == "edit_back_to_hour")
+async def user_edit_back_to_hour(callback: types.CallbackQuery, state: FSMContext):
+    kb = InlineKeyboardBuilder()
+    for hour in range(24):
+        kb.button(text=f"{hour:02d}", callback_data=f"uhour_{hour:02d}")
+    kb.adjust(6)
+
+    await state.set_state(UserEditForm.hour)
+    await callback.message.answer(
+        "⏰ Оберіть годину:",
+        reply_markup=add_inline_navigation(kb, back_callback="edit_back_to_calendar").as_markup()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(UserEditForm.minute, F.data.startswith("umin_"))
+async def user_edit_minute(callback: types.CallbackQuery, state: FSMContext):
+    minute = callback.data.replace("umin_", "")
+    data = await state.get_data()
+
+    req_id = data.get("req_id")
+    reason = data.get("reason")
+    new_date: date = data.get("new_date")
+    new_time = f"{data['new_hour']}:{minute}"
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.user_id != callback.from_user.id:
+            await state.clear()
+            return await callback.answer("Заявка не знайдена", show_alert=True)
+
+        req.date = new_date
+        req.time = new_time
+        req.status = "new"
+        req.admin_id = None
+        await session.commit()
+
+    await callback.message.answer(
+        f"Запит на зміну заявки #{req.id} відправлено адміністратору.\n"
+        f"📅 {req.date.strftime('%d.%m.%Y')} ⏰ {req.time}"
+    )
+
+    await notify_admins_about_user_edit(req, reason)
+    await state.clear()
+    await callback.answer()
 
 
 ###############################################################
@@ -329,7 +672,7 @@ async def admin_all(callback: types.CallbackQuery):
     text = "<b>📚 Останні 20 заявок:</b>\n\n"
     kb = InlineKeyboardBuilder()
     for r in rows:
-        status = "🟢 NEW" if r.status == "new" else f"⚪ {r.status}"
+        status = "🟢 NEW" if r.status == "new" else f"⚪ {get_status_label(r.status)}"
         text += (
             f"• <b>#{r.id}</b>  "
             f"{r.date.strftime('%d.%m.%Y')} {r.time}  —  {status}\n"
@@ -355,11 +698,7 @@ async def admin_view(callback: types.CallbackQuery):
     if not req:
         return await callback.answer("Заявка не знайдена", show_alert=True)
 
-    status = {
-        "new": "🟢 Нова",
-        "approved": "✔ Підтверджена",
-        "rejected": "❌ Відхилена",
-    }.get(req.status, req.status)
+    status = get_status_label(req.status)
 
     text = (
         f"<b>📄 Заявка #{req.id}</b>\n"
@@ -1144,7 +1483,24 @@ async def notify_admins_about_action(req: Request, action: str):
         except:
             pass
 
+async def notify_admins_about_user_edit(req: Request, reason: str):
+    async with SessionLocal() as session:
+        admins = (await session.execute(select(Admin))).scalars().all()
 
+    text = (
+        f"ℹ️ Поставщик {req.supplier} змінив заявку #{req.id}\n"
+        f"Причина: {reason}\n\n"
+        f"Потрібно повторно підтвердити/відхилити або скоригувати дату чи час.\n"
+        f"📅 {req.date.strftime('%d.%m.%Y')} ⏰ {req.time}\n"
+        f"👤 {req.driver_name} — {req.phone}"
+    )
+
+    for admin in admins:
+        try:
+            await bot.send_message(admin.telegram_id, text)
+        except:
+            pass
+            
 ###############################################################
 #                         BOT STARTUP                         
 ###############################################################
