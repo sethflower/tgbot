@@ -1032,12 +1032,23 @@ async def admin_all(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("admin_view_"))
 async def admin_view(callback: types.CallbackQuery):
     req_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
 
     async with SessionLocal() as session:
         req = await session.get(Request, req_id)
+        admin = (
+            await session.execute(
+                select(Admin).where(Admin.telegram_id == user_id)
+            )
+        ).scalar_one_or_none()
 
     if not req:
         return await callback.answer("Заявка не знайдена", show_alert=True)
+
+    is_superadmin = user_id == SUPERADMIN_ID or (admin and admin.is_superadmin)
+
+    if not (is_superadmin or admin):
+        return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
 
     status = get_status_label(req.status)
 
@@ -1057,6 +1068,8 @@ async def admin_view(callback: types.CallbackQuery):
     kb.button(text="✔ Підтвердити", callback_data=f"adm_ok_{req.id}")
     kb.button(text="🔁 Змінити дату/час", callback_data=f"adm_change_{req.id}")
     kb.button(text="❌ Відхилити", callback_data=f"adm_rej_{req.id}")
+    if is_superadmin or req.status != "new":
+        kb.button(text="🗑 Видалити", callback_data=f"adm_del_{req.id}")
     kb.button(text="⬅️ До списку", callback_data="admin_all")
     kb.adjust(1)
     kb = add_inline_navigation(kb)
@@ -1659,10 +1672,41 @@ async def adm_rej(callback: types.CallbackQuery):
     )
 
     await notify_admins_about_action(req, "відхилена")
+@dp.callback_query(F.data.startswith("adm_del_"))
+async def adm_delete(callback: types.CallbackQuery):
+    req_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
 
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        admin = (
+            await session.execute(
+                select(Admin).where(Admin.telegram_id == user_id)
+            )
+        ).scalar_one_or_none()
+
+        is_superadmin = user_id == SUPERADMIN_ID or (admin and admin.is_superadmin)
+
+        if not req:
+            return await callback.answer("Заявка не знайдена", show_alert=True)
+
+        if not (is_superadmin or admin):
+            return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
+
+        if not is_superadmin and req.status == "new":
+            return await callback.answer(
+                "Заявки зі статусом 'Нова' може видаляти лише суперадміністратор.",
+                show_alert=True,
+            )
+
+        await session.delete(req)
+        await session.commit()
+
+    await callback.message.answer("🗑 Заявку видалено з бази.")
+    await callback.answer()
 
 ###############################################################
-#           ADMIN — CHANGE DATE/TIME (FSM Aiogram 3)          
+#           ADMIN — CHANGE DATE/TIME (FSM Aiogram 3)
 ###############################################################
 
 @dp.callback_query(F.data.startswith("adm_change_"))
