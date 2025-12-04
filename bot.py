@@ -205,10 +205,12 @@ class UserDeleteForm(StatesGroup):
 
 class UserEditForm(StatesGroup):
     user_id = State()
-    calendar = State()      # <-- добавили состояние для работы с календарём
+    calendar = State()
     new_date = State()
+    hour = State()     # <-- ДОБАВЛЕННОЕ СОСТОЯНИЕ
     new_time = State()
     reason = State()
+
 
 
 
