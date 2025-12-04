@@ -203,6 +203,13 @@ class UserDeleteForm(StatesGroup):
     user_id = State()
     reason = State()
 
+class UserEditForm(StatesGroup):
+    user_id = State()
+    new_date = State()
+    new_time = State()
+    reason = State()
+
+
 ###############################################################
 #                 START → BEAUTIFUL RED CARD                  
 ###############################################################
