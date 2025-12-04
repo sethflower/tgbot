@@ -570,6 +570,7 @@ async def finalize_user_edit_update(
     reason: str,
     *,
     text: str,
+    changes: list[tuple[str, str, str]],
 ):
     req.status = "new"
     req.admin_id = None
@@ -580,7 +581,7 @@ async def finalize_user_edit_update(
 
     target = message_or_callback.message if isinstance(message_or_callback, types.CallbackQuery) else message_or_callback
     await target.answer(text, reply_markup=navigation_keyboard(include_back=False))
-    await notify_admins_about_user_edit(req, reason)
+    await notify_admins_about_user_edit(req, reason, changes)
     await state.clear()
     if isinstance(message_or_callback, types.CallbackQuery):
         await message_or_callback.answer()
@@ -618,6 +619,7 @@ async def user_edit_supplier(message: types.Message, state: FSMContext):
     if not req:
         return await message.answer("Заявка не знайдена або вам не належить.")
 
+    old_value = req.supplier
     req.supplier = value
     await finalize_user_edit_update(
         message,
@@ -625,6 +627,7 @@ async def user_edit_supplier(message: types.Message, state: FSMContext):
         req,
         reason or "",
         text=f"Поле 'Постачальник' оновлено для заявки #{req.id}.",
+        changes=[("Постачальник", old_value, req.supplier)],
     )
 
 @dp.message(UserEditForm.driver_name)
@@ -644,6 +647,7 @@ async def user_edit_driver(message: types.Message, state: FSMContext):
     if not req:
         return await message.answer("Заявка не знайдена або вам не належить.")
 
+    old_value = req.driver_name
     req.driver_name = value
     await finalize_user_edit_update(
         message,
@@ -651,6 +655,7 @@ async def user_edit_driver(message: types.Message, state: FSMContext):
         req,
         reason or "",
         text=f"Поле 'Водій' оновлено для заявки #{req.id}.",
+        changes=[("Водій", old_value, req.driver_name)],
     )
 
 
@@ -671,6 +676,7 @@ async def user_edit_phone(message: types.Message, state: FSMContext):
     if not req:
         return await message.answer("Заявка не знайдена або вам не належить.")
 
+    old_value = req.phone
     req.phone = value
     await finalize_user_edit_update(
         message,
@@ -678,6 +684,7 @@ async def user_edit_phone(message: types.Message, state: FSMContext):
         req,
         reason or "",
         text=f"Поле 'Телефон' оновлено для заявки #{req.id}.",
+        changes=[("Телефон", old_value, req.phone)],
     )
 
 
@@ -698,6 +705,7 @@ async def user_edit_car(message: types.Message, state: FSMContext):
     if not req:
         return await message.answer("Заявка не знайдена або вам не належить.")
 
+    old_value = req.car
     req.car = value
     await finalize_user_edit_update(
         message,
@@ -705,6 +713,7 @@ async def user_edit_car(message: types.Message, state: FSMContext):
         req,
         reason or "",
         text=f"Поле 'Авто' оновлено для заявки #{req.id}.",
+        changes=[("Авто", old_value, req.car)],
     )
 
 
@@ -723,6 +732,7 @@ async def user_edit_docs(message: types.Message, state: FSMContext):
     if not req:
         return await message.answer("Заявка не знайдена або вам не належить.")
 
+    old_value = "Додані" if req.docs_file_id else "Відсутні"
     if message.photo:
         req.docs_file_id = message.photo[-1].file_id
         status_text = "Фото документів оновлено"
@@ -740,6 +750,7 @@ async def user_edit_docs(message: types.Message, state: FSMContext):
         req,
         reason or "",
         text=f"{status_text} для заявки #{req.id}.",
+        changes=[("Документи", old_value, "Додані" if req.docs_file_id else "Відсутні")],
     )
 
 
@@ -765,6 +776,7 @@ async def user_edit_loading(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Заявка не знайдена", show_alert=True)
         return
 
+    old_value = req.loading_type
     req.loading_type = new_value
     await finalize_user_edit_update(
         callback,
@@ -772,6 +784,7 @@ async def user_edit_loading(callback: types.CallbackQuery, state: FSMContext):
         req,
         reason or "",
         text=f"Тип завантаження оновлено для заявки #{req.id}.",
+        changes=[("Тип завантаження", old_value, req.loading_type)],
     )
 
 
@@ -943,6 +956,8 @@ async def user_edit_minute(callback: types.CallbackQuery, state: FSMContext):
     if not req:
         return await callback.answer("Заявка не знайдена", show_alert=True)
 
+    old_date = req.date
+    old_time = req.time
     req.date = data.get("new_date")
     req.time = f"{data['new_hour']}:{minute}"
 
@@ -955,6 +970,11 @@ async def user_edit_minute(callback: types.CallbackQuery, state: FSMContext):
             f"Запит на зміну заявки #{req.id} відправлено адміністратору.\n"
             f"📅 {req.date.strftime('%d.%m.%Y')} ⏰ {req.time}"
         ),
+        changes=[(
+            "Дата та час",
+            f"{old_date.strftime('%d.%m.%Y')} {old_time}",
+            f"{req.date.strftime('%d.%m.%Y')} {req.time}"
+        )],
     )
 
 
@@ -1908,16 +1928,23 @@ async def notify_admins_about_action(req: Request, action: str):
         except:
             pass
 
-async def notify_admins_about_user_edit(req: Request, reason: str):
+async def notify_admins_about_user_edit(
+    req: Request, reason: str, changes: list[tuple[str, str, str]]
+):
     async with SessionLocal() as session:
         admins = (await session.execute(select(Admin))).scalars().all()
+
+    changes_text = "\n".join(
+        f"• <b>{label}:</b> {old} → {new}" for label, old, new in changes
+    ) or "• Зміни не зафіксовані"
 
     text = (
         f"ℹ️ Поставщик {req.supplier} змінив заявку #{req.id}\n"
         f"Причина: {reason}\n\n"
         f"Потрібно повторно підтвердити/відхилити або скоригувати дату чи час.\n"
         f"📅 {req.date.strftime('%d.%m.%Y')} ⏰ {req.time}\n"
-        f"👤 {req.driver_name} — {req.phone}"
+        f"👤 {req.driver_name} — {req.phone}\n\n"
+        f"Що змінено:\n{changes_text}"
     )
 
     for admin in admins:
