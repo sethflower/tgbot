@@ -142,7 +142,7 @@ def add_inline_navigation(builder: InlineKeyboardBuilder, back_callback: str | N
 async def show_main_menu(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "<b>🏠 DC Link | Головне меню</b>\n"
+        "<b>🏠 DC Link черга | Головне меню</b>\n"
         "Оберіть, що зробити просто зараз:",
         reply_markup=navigation_keyboard(include_back=False),
     )
