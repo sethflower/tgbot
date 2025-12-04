@@ -298,7 +298,7 @@ def build_recent_request_ids(reqs: list[Request]) -> set[int]:
 
 async def send_request_details(
     req: Request,
-    callback_or_message: Union[types.CallbackQuery, types.Message],
+    callback_or_message: types.CallbackQuery | types.Message,
     *,
     allow_actions: bool,
     recent_ids: set[int] | None = None,
