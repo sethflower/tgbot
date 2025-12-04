@@ -207,8 +207,8 @@ async def start(message: types.Message, state: FSMContext):
     await state.clear()
 
     text = (
-        "🟥 <b>DC Link — Електронна черга водіїв</b>\n\n"
-        "👋 Вітаємо у електронній черзі водіїв DCLink!\n"
+        "🟥 <b>DC Link — Електронна черга постачальників</b>\n\n"
+        "👋 Вітаємо у електронній черзі постачальників\n"
         "Цей бот допоможе створити заявку на вивантаження.\n\n"
         "Натисніть кнопку нижче, щоб почати."
     )
@@ -225,7 +225,7 @@ async def menu_new(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
 
     await callback.message.answer(
-        "🔹 Введіть постачальника:",
+        "📦 Введіть назву постачальника:",
         reply_markup=navigation_keyboard(include_back=False)
     )
 
@@ -520,7 +520,7 @@ async def step_supplier(message: types.Message, state: FSMContext):
     await state.update_data(supplier=supplier)
 
     await message.answer(
-        "🔹 Введіть ПІБ водія:",
+        "🚛 Введіть ПІБ водія:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.driver_name)
@@ -531,7 +531,7 @@ async def step_driver_name(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.supplier)
         return await message.answer(
-            "🔹 Введіть постачальника:",
+            "📦 Введіть постачальника:",
             reply_markup=navigation_keyboard(include_back=False)
         )
 
@@ -541,7 +541,7 @@ async def step_driver_name(message: types.Message, state: FSMContext):
 
     await state.update_data(driver_name=name)
 
-    await message.answer("🔹 Введіть номер телефону:", reply_markup=navigation_keyboard())
+    await message.answer("📞 Введіть номер телефону:", reply_markup=navigation_keyboard())
     await state.set_state(QueueForm.phone)
 
 
@@ -550,7 +550,7 @@ async def step_phone(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.driver_name)
         return await message.answer(
-            "🔹 Введіть ПІБ водія:",
+            "🚛 Введіть ПІБ водія:",
             reply_markup=navigation_keyboard()
         )
 
@@ -560,7 +560,7 @@ async def step_phone(message: types.Message, state: FSMContext):
 
     await state.update_data(phone=phone)
 
-    await message.answer("🔹 Введіть марку і номер авто:", reply_markup=navigation_keyboard())
+    await message.answer("🚚 Введіть марку і номер авто:", reply_markup=navigation_keyboard())
     await state.set_state(QueueForm.car)
 
 
@@ -569,7 +569,7 @@ async def step_car(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.phone)
         return await message.answer(
-            "🔹 Введіть номер телефону:",
+            "📞 Введіть номер телефону:",
             reply_markup=navigation_keyboard()
         )
 
@@ -585,7 +585,7 @@ async def step_car(message: types.Message, state: FSMContext):
     kb.adjust(1)
 
     await message.answer(
-        "🔹 Завантажте фото документів або пропустіть:",
+        "📋 Завантажте фото документів або пропустіть:",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
     )
 
@@ -602,7 +602,7 @@ async def photo_upload(callback: types.CallbackQuery):
 async def back_to_car(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(QueueForm.car)
     await callback.message.answer(
-        "🔹 Введіть марку і номер авто:",
+        "🚚 Введіть марку і номер авто:",
         reply_markup=navigation_keyboard()
     )
     await callback.answer()
@@ -612,7 +612,7 @@ async def back_to_car(callback: types.CallbackQuery, state: FSMContext):
 async def docs_back(message: types.Message, state: FSMContext):
     await state.set_state(QueueForm.car)
     await message.answer(
-        "🔹 Введіть марку і номер авто:",
+        "🚚 Введіть марку і номер авто:",
         reply_markup=navigation_keyboard()
     )
 
@@ -638,12 +638,12 @@ async def photo_received(message: types.Message, state: FSMContext):
 async def photo_done(callback: types.CallbackQuery, state: FSMContext):
 
     kb = InlineKeyboardBuilder()
-    kb.button(text="📦 На палетах", callback_data="type_pal")
-    kb.button(text="🧱 В розсип", callback_data="type_loose")
+    kb.button(text="🚚 На палетах", callback_data="type_pal")
+    kb.button(text="📦 В розсип", callback_data="type_loose")
     kb.adjust(1)
 
     await callback.message.answer(
-        "🔹 Оберіть тип завантаження:",
+        "😉 Оберіть тип завантаження:",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_docs").as_markup()
     )
 
@@ -658,7 +658,7 @@ async def loading_back(callback: types.CallbackQuery, state: FSMContext):
 
     await state.set_state(QueueForm.docs)
     await callback.message.answer(
-        "🔹 Завантажте документи або пропустіть:",
+        "📋 Завантажте документи або пропустіть:",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
     )
     await callback.answer()
@@ -777,8 +777,8 @@ async def cal_next(callback: types.CallbackQuery):
 @dp.callback_query(QueueForm.calendar, F.data == "back_to_loading")
 async def cal_back_to_loading(callback: types.CallbackQuery, state: FSMContext):
     kb = InlineKeyboardBuilder()
-    kb.button(text="📦 На палетах", callback_data="type_pal")
-    kb.button(text="🧱 В розсип", callback_data="type_loose")
+    kb.button(text="🚚 На палетах", callback_data="type_pal")
+    kb.button(text="📦 В розсип", callback_data="type_loose")
     kb.adjust(1)
 
     await state.set_state(QueueForm.loading_type)
