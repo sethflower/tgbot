@@ -8,6 +8,7 @@ import os
 import asyncio
 import logging
 from datetime import datetime, date, timedelta
+from typing import Any
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
@@ -19,7 +20,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     KeyboardButton,
     InlineKeyboardButton,
 )
@@ -141,7 +141,7 @@ def add_inline_navigation(builder: InlineKeyboardBuilder, back_callback: str | N
 
 async def show_main_menu(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("🏠 Ви у головному меню.", reply_markup=ReplyKeyboardRemove())
+    await message.answer("🏠 Ви у головному меню.", reply_markup=navigation_keyboard(include_back=False))
     await message.answer("Оберіть дію:", reply_markup=main_menu())
 
 
@@ -170,7 +170,7 @@ def admin_menu():
     kb.button(text="➖ Видалити адміна", callback_data="admin_remove")
     kb.button(text="🗑 Очистити БД", callback_data="admin_clear")
     kb.adjust(1)
-    return kb.as_markup()
+    return add_inline_navigation(kb).as_markup()
 
 
 ###############################################################
@@ -205,6 +205,13 @@ class UserDeleteForm(StatesGroup):
 
 class UserEditForm(StatesGroup):
     user_id = State()
+    field_choice = State()
+    supplier = State()
+    driver_name = State()
+    phone = State()
+    car = State()
+    docs = State()
+    loading_type = State()
     calendar = State()     # выбор даты
     new_date = State()     # подтверждение даты
     hour = State()         # выбор часа
@@ -231,7 +238,8 @@ async def start(message: types.Message, state: FSMContext):
         "Натисніть кнопку нижче, щоб почати."
     )
 
-    await message.answer(text, reply_markup=main_menu())
+    await message.answer(text, reply_markup=navigation_keyboard(include_back=False))
+    await message.answer("Оберіть дію:", reply_markup=main_menu())
 
 
 ###############################################################
@@ -403,19 +411,33 @@ async def my_delete(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-async def notify_admins_about_user_deletion(req: Request, reason: str):
+async def notify_admins_about_user_deletion(req: Request | dict[str, Any], reason: str):
     async with SessionLocal() as session:
         admins = (await session.execute(select(Admin))).scalars().all()
 
+    if isinstance(req, Request):
+        data = {
+            "id": req.id,
+            "supplier": req.supplier,
+            "driver_name": req.driver_name,
+            "phone": req.phone,
+            "car": req.car,
+            "loading_type": req.loading_type,
+            "date": req.date,
+            "time": req.time,
+        }
+    else:
+        data = req
+
     text = (
-        f"❗ Поставщик {req.supplier} видалив заявку #{req.id}\n"
+        f"❗ Поставщик {data['supplier']} видалив заявку #{data['id']}\n"
         f"Причина: {reason}\n\n"
         f"📄 Дані заявки до видалення:\n"
-        f"👤 {req.driver_name}\n"
-        f"📞 {req.phone}\n"
-        f"🚚 {req.car}\n"
-        f"🧱 {req.loading_type}\n"
-        f"📅 {req.date.strftime('%d.%m.%Y')} ⏰ {req.time}"
+        f"👤 {data['driver_name']}\n"
+        f"📞 {data['phone']}\n"
+        f"🚚 {data['car']}\n"
+        f"🧱 {data['loading_type']}\n"
+        f"📅 {data['date'].strftime('%d.%m.%Y')} ⏰ {data['time']}"
     )
 
     for admin in admins:
@@ -440,11 +462,25 @@ async def my_delete_reason(message: types.Message, state: FSMContext):
             await state.clear()
             return await message.answer("Заявка не знайдена або вам не належить.")
 
-        req.status = "deleted_by_user"
+        req_data = {
+            "id": req.id,
+            "supplier": req.supplier,
+            "driver_name": req.driver_name,
+            "phone": req.phone,
+            "car": req.car,
+            "loading_type": req.loading_type,
+            "date": req.date,
+            "time": req.time,
+        }
+
+        await session.delete(req)
         await session.commit()
 
-    await notify_admins_about_user_deletion(req, reason)
-    await message.answer("Заявку видалено. Адміністратори отримали повідомлення.")
+    await notify_admins_about_user_deletion(req_data, reason)
+    await message.answer(
+        "Заявку видалено з бази. Адміністратори отримали повідомлення.",
+        reply_markup=navigation_keyboard(include_back=False),
+    )
     await state.clear()
 
 
@@ -476,6 +512,18 @@ async def my_edit(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+def build_user_edit_choice_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏢 Постачальник", callback_data="edit_field_supplier")
+    kb.button(text="👤 Водій", callback_data="edit_field_driver")
+    kb.button(text="📞 Телефон", callback_data="edit_field_phone")
+    kb.button(text="🚚 Авто", callback_data="edit_field_car")
+    kb.button(text="🧱 Тип завантаження", callback_data="edit_field_loading")
+    kb.button(text="📄 Документи", callback_data="edit_field_docs")
+    kb.button(text="📅 Дата та час", callback_data="edit_field_datetime")
+    kb.adjust(1)
+    return add_inline_navigation(kb, back_callback="edit_cancel").as_markup()
+
 @dp.message(UserEditForm.reason)
 async def my_edit_reason(message: types.Message, state: FSMContext):
     reason = message.text.strip()
@@ -492,31 +540,311 @@ async def my_edit_reason(message: types.Message, state: FSMContext):
             return await message.answer("Заявка не знайдена або вам не належить.")
 
     await state.update_data(reason=reason)
-    await state.set_state(UserEditForm.calendar)
+    await state.set_state(UserEditForm.field_choice)
     await message.answer(
-        "Оберіть нову дату:",
-        reply_markup=build_date_calendar()
+        "Оберіть, що потрібно змінити у заявці:",
+        reply_markup=build_user_edit_choice_keyboard(),
     )
 
+
+async def finalize_user_edit_update(
+    message_or_callback: types.Message | types.CallbackQuery,
+    state: FSMContext,
+    req: Request,
+    reason: str,
+    *,
+    text: str,
+):
+    req.status = "new"
+    req.admin_id = None
+
+    async with SessionLocal() as session:
+        session.add(req)
+        await session.commit()
+
+    target = message_or_callback.message if isinstance(message_or_callback, types.CallbackQuery) else message_or_callback
+    await target.answer(text, reply_markup=navigation_keyboard(include_back=False))
+    await notify_admins_about_user_edit(req, reason)
+    await state.clear()
+    if isinstance(message_or_callback, types.CallbackQuery):
+        await message_or_callback.answer()
+
+
+async def _load_request_for_edit(state: FSMContext, user_id: int) -> tuple[Request | None, str | None]:
+    data = await state.get_data()
+    req_id = data.get("req_id")
+    reason = data.get("reason")
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+
+    if not req or req.user_id != user_id:
+        await state.clear()
+        return None, None
+
+    return req, reason
+
+
+@dp.message(UserEditForm.supplier)
+async def user_edit_supplier(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(UserEditForm.field_choice)
+        return await message.answer(
+            "Оберіть, що потрібно змінити у заявці:",
+            reply_markup=build_user_edit_choice_keyboard(),
+        )
+
+    value = message.text.strip()
+    if not value:
+        return await message.answer("Значення не може бути порожнім.")
+
+    req, reason = await _load_request_for_edit(state, message.from_user.id)
+    if not req:
+        return await message.answer("Заявка не знайдена або вам не належить.")
+
+    req.supplier = value
+    await finalize_user_edit_update(
+        message,
+        state,
+        req,
+        reason or "",
+        text=f"Поле 'Постачальник' оновлено для заявки #{req.id}.",
+    )
+
+@dp.message(UserEditForm.driver_name)
+async def user_edit_driver(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(UserEditForm.field_choice)
+        return await message.answer(
+            "Оберіть, що потрібно змінити у заявці:",
+            reply_markup=build_user_edit_choice_keyboard(),
+        )
+
+    value = message.text.strip()
+    if not value:
+        return await message.answer("Значення не може бути порожнім.")
+
+    req, reason = await _load_request_for_edit(state, message.from_user.id)
+    if not req:
+        return await message.answer("Заявка не знайдена або вам не належить.")
+
+    req.driver_name = value
+    await finalize_user_edit_update(
+        message,
+        state,
+        req,
+        reason or "",
+        text=f"Поле 'Водій' оновлено для заявки #{req.id}.",
+    )
+
+
+@dp.message(UserEditForm.phone)
+async def user_edit_phone(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(UserEditForm.field_choice)
+        return await message.answer(
+            "Оберіть, що потрібно змінити у заявці:",
+            reply_markup=build_user_edit_choice_keyboard(),
+        )
+
+    value = message.text.strip()
+    if not value:
+        return await message.answer("Значення не може бути порожнім.")
+
+    req, reason = await _load_request_for_edit(state, message.from_user.id)
+    if not req:
+        return await message.answer("Заявка не знайдена або вам не належить.")
+
+    req.phone = value
+    await finalize_user_edit_update(
+        message,
+        state,
+        req,
+        reason or "",
+        text=f"Поле 'Телефон' оновлено для заявки #{req.id}.",
+    )
+
+
+@dp.message(UserEditForm.car)
+async def user_edit_car(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(UserEditForm.field_choice)
+        return await message.answer(
+            "Оберіть, що потрібно змінити у заявці:",
+            reply_markup=build_user_edit_choice_keyboard(),
+        )
+
+    value = message.text.strip()
+    if not value:
+        return await message.answer("Значення не може бути порожнім.")
+
+    req, reason = await _load_request_for_edit(state, message.from_user.id)
+    if not req:
+        return await message.answer("Заявка не знайдена або вам не належить.")
+
+    req.car = value
+    await finalize_user_edit_update(
+        message,
+        state,
+        req,
+        reason or "",
+        text=f"Поле 'Авто' оновлено для заявки #{req.id}.",
+    )
+
+
+@dp.message(UserEditForm.docs, F.text == BACK_TEXT)
+async def user_edit_docs_back(message: types.Message, state: FSMContext):
+    await state.set_state(UserEditForm.field_choice)
+    await message.answer(
+        "Оберіть, що потрібно змінити у заявці:",
+        reply_markup=build_user_edit_choice_keyboard(),
+    )
+
+
+@dp.message(UserEditForm.docs)
+async def user_edit_docs(message: types.Message, state: FSMContext):
+    req, reason = await _load_request_for_edit(state, message.from_user.id)
+    if not req:
+        return await message.answer("Заявка не знайдена або вам не належить.")
+
+    if message.photo:
+        req.docs_file_id = message.photo[-1].file_id
+        status_text = "Фото документів оновлено"
+    elif message.text and message.text.lower().strip() == "без документів":
+        req.docs_file_id = None
+        status_text = "Файли документів видалено"
+    else:
+        return await message.answer(
+            "Надішліть фото або напишіть 'Без документів', щоб прибрати файл."
+        )
+
+    await finalize_user_edit_update(
+        message,
+        state,
+        req,
+        reason or "",
+        text=f"{status_text} для заявки #{req.id}.",
+    )
+
+
+@dp.callback_query(UserEditForm.loading_type, F.data == "edit_back_to_choice")
+async def user_edit_loading_back(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(UserEditForm.field_choice)
+    await callback.message.answer(
+        "Оберіть, що потрібно змінити у заявці:",
+        reply_markup=build_user_edit_choice_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(UserEditForm.loading_type)
+async def user_edit_loading(callback: types.CallbackQuery, state: FSMContext):
+    if callback.data not in {"edit_type_pal", "edit_type_loose"}:
+        return await callback.answer("Невідомий варіант!", show_alert=True)
+
+    new_value = "Палети" if callback.data == "edit_type_pal" else "Розсип"
+
+    req, reason = await _load_request_for_edit(state, callback.from_user.id)
+    if not req:
+        await callback.answer("Заявка не знайдена", show_alert=True)
+        return
+
+    req.loading_type = new_value
+    await finalize_user_edit_update(
+        callback,
+        state,
+        req,
+        reason or "",
+        text=f"Тип завантаження оновлено для заявки #{req.id}.",
+    )
+
+
+@dp.callback_query(UserEditForm.field_choice, F.data == "edit_cancel")
+async def user_edit_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer(
+        "Редагування скасовано.", reply_markup=navigation_keyboard(include_back=False)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(UserEditForm.field_choice, F.data.startswith("edit_field_"))
+async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContext):
+    choice = callback.data.replace("edit_field_", "")
+
+    prompts = {
+        "supplier": (UserEditForm.supplier, "Введіть нову назву постачальника:"),
+        "driver": (UserEditForm.driver_name, "Введіть нове ім'я водія:"),
+        "phone": (UserEditForm.phone, "Введіть новий номер телефону:"),
+        "car": (UserEditForm.car, "Введіть нову марку і номер авто:"),
+    }
+
+    if choice in prompts:
+        next_state, text = prompts[choice]
+        await state.set_state(next_state)
+        await callback.message.answer(text, reply_markup=navigation_keyboard())
+    elif choice == "loading":
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🚚 На палетах", callback_data="edit_type_pal")
+        kb.button(text="📦 В розсип", callback_data="edit_type_loose")
+        kb.adjust(1)
+
+        await state.set_state(UserEditForm.loading_type)
+        await callback.message.answer(
+            "Оберіть новий тип завантаження:",
+            reply_markup=add_inline_navigation(kb, back_callback="edit_back_to_choice").as_markup(),
+        )
+    elif choice == "docs":
+        await state.set_state(UserEditForm.docs)
+        await callback.message.answer(
+            "Надішліть нове фото документів або напишіть 'Без документів' щоб прибрати файл.",
+            reply_markup=navigation_keyboard(),
+        )
+    elif choice == "datetime":
+        await state.set_state(UserEditForm.calendar)
+        await callback.message.answer(
+            "Оберіть нову дату:",
+            reply_markup=build_date_calendar(back_callback="edit_back_to_choice"),
+        )
+    else:
+        await callback.message.answer("Невідомий вибір.")
+
+    await callback.answer()
 
 @dp.callback_query(UserEditForm.calendar, F.data.startswith("prev_"))
 async def user_edit_prev(callback: types.CallbackQuery, state: FSMContext):
     _, y, m = callback.data.split("_")
-    await callback.message.edit_reply_markup(reply_markup=build_date_calendar(int(y), int(m)))
+    await callback.message.edit_reply_markup(
+        reply_markup=build_date_calendar(int(y), int(m), back_callback="edit_back_to_choice")
+    )
     await callback.answer()
 
 
 @dp.callback_query(UserEditForm.calendar, F.data.startswith("next_"))
 async def user_edit_next(callback: types.CallbackQuery, state: FSMContext):
     _, y, m = callback.data.split("_")
-    await callback.message.edit_reply_markup(reply_markup=build_date_calendar(int(y), int(m)))
+    await callback.message.edit_reply_markup(
+        reply_markup=build_date_calendar(int(y), int(m), back_callback="edit_back_to_choice")
+    )
     await callback.answer()
 
 
 @dp.callback_query(UserEditForm.calendar, F.data == "close_calendar")
 async def user_edit_cancel_calendar(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.answer("Зміну заявки скасовано.")
+    await callback.message.answer(
+        "Зміну заявки скасовано.", reply_markup=navigation_keyboard(include_back=False)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(UserEditForm.calendar, F.data == "edit_back_to_choice")
+async def user_edit_back_to_choice(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(UserEditForm.field_choice)
+    await callback.message.answer(
+        "Оберіть, що потрібно змінити у заявці:",
+        reply_markup=build_user_edit_choice_keyboard(),
+    )
     await callback.answer()
 
 
@@ -546,9 +874,11 @@ async def user_edit_back_to_calendar(callback: types.CallbackQuery, state: FSMCo
     chosen_date: date | None = data.get("new_date")
 
     if chosen_date:
-        markup = build_date_calendar(chosen_date.year, chosen_date.month)
+        markup = build_date_calendar(
+            chosen_date.year, chosen_date.month, back_callback="edit_back_to_choice"
+        )
     else:
-        markup = build_date_calendar()
+        markup = build_date_calendar(back_callback="edit_back_to_choice")
 
     await state.set_state(UserEditForm.calendar)
     await callback.message.answer("Оберіть нову дату:", reply_markup=markup)
@@ -593,31 +923,24 @@ async def user_edit_minute(callback: types.CallbackQuery, state: FSMContext):
     minute = callback.data.replace("umin_", "")
     data = await state.get_data()
 
-    req_id = data.get("req_id")
-    reason = data.get("reason")
-    new_date: date = data.get("new_date")
-    new_time = f"{data['new_hour']}:{minute}"
+    req, reason = await _load_request_for_edit(state, callback.from_user.id)
+    if not req:
+        return await callback.answer("Заявка не знайдена", show_alert=True)
 
-    async with SessionLocal() as session:
-        req = await session.get(Request, req_id)
-        if not req or req.user_id != callback.from_user.id:
-            await state.clear()
-            return await callback.answer("Заявка не знайдена", show_alert=True)
+    req.date = data.get("new_date")
+    req.time = f"{data['new_hour']}:{minute}"
 
-        req.date = new_date
-        req.time = new_time
-        req.status = "new"
-        req.admin_id = None
-        await session.commit()
-
-    await callback.message.answer(
-        f"Запит на зміну заявки #{req.id} відправлено адміністратору.\n"
-        f"📅 {req.date.strftime('%d.%m.%Y')} ⏰ {req.time}"
+    await finalize_user_edit_update(
+        callback,
+        state,
+        req,
+        reason or "",
+        text=(
+            f"Запит на зміну заявки #{req.id} відправлено адміністратору.\n"
+            f"📅 {req.date.strftime('%d.%m.%Y')} ⏰ {req.time}"
+        ),
     )
 
-    await notify_admins_about_user_edit(req, reason)
-    await state.clear()
-    await callback.answer()
 
 
 ###############################################################
@@ -736,6 +1059,7 @@ async def admin_view(callback: types.CallbackQuery):
     kb.button(text="❌ Відхилити", callback_data=f"adm_rej_{req.id}")
     kb.button(text="⬅️ До списку", callback_data="admin_all")
     kb.adjust(1)
+    kb = add_inline_navigation(kb)
 
     if req.docs_file_id:
         await callback.message.answer_photo(
@@ -764,7 +1088,7 @@ async def admin_add(callback: types.CallbackQuery, state: FSMContext):
 async def admin_add_wait(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.clear()
-        await message.answer("Скасовано.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("Скасовано.", reply_markup=navigation_keyboard(include_back=False))
         return await show_main_menu(message, state)
 
 
@@ -785,7 +1109,7 @@ async def admin_add_wait(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"✔ Користувач <code>{tg_id}</code> доданий як адміністратор.",
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=navigation_keyboard(include_back=False)
     )
 
 
@@ -806,7 +1130,7 @@ async def admin_remove(callback: types.CallbackQuery, state: FSMContext):
 async def admin_remove_wait(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.clear()
-        await message.answer("Скасовано.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("Скасовано.", reply_markup=navigation_keyboard(include_back=False))
         return await show_main_menu(message, state)
 
     try:
@@ -821,7 +1145,7 @@ async def admin_remove_wait(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"🗑 Адміністратора <code>{tg_id}</code> видалено.",
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=navigation_keyboard(include_back=False)
     )
 
 
@@ -839,6 +1163,7 @@ async def admin_clear(callback: types.CallbackQuery):
     kb.button(text="🗑 Видалити всі заявки", callback_data="admin_clear_yes")
     kb.button(text="❌ Скасувати", callback_data="admin_clear_no")
     kb.adjust(1)
+    kb = add_inline_navigation(kb)
 
     await callback.message.answer(
         "⚠️ Ви впевнені, що хочете видалити всі заявки?",
