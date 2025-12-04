@@ -123,21 +123,6 @@ async def init_db():
 BACK_TEXT = "⬅️ Назад"
 MAIN_MENU_TEXT = "🏠 Головне меню"
 
-WELCOME_MESSAGE = (
-    "🟥 <b>DC Link — Електронна черга постачальників</b>\n\n"
-    "👋 Ласкаво просимо! Цей бот допоможе швидко та безпечно створити заявку на вивантаження.\n"
-    
-)
-
-
-def prettified_prompt(subtitle: str) -> str:
-    """Render a compact, візуально приємний підказку з фірмовим стилем."""
-    return (
-        "<b>✨ Інтерактивний помічник</b>\n"
-        f"{subtitle}\n\n"
-        "🔹 Скористайтесь кнопками нижче для навігації."
-    )
-
 
 def navigation_keyboard(include_back=True):
     buttons = [[KeyboardButton(text=MAIN_MENU_TEXT)]]
@@ -156,10 +141,7 @@ def add_inline_navigation(builder: InlineKeyboardBuilder, back_callback: str | N
 
 async def show_main_menu(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        prettified_prompt("🏠 Ви у головному меню."),
-        reply_markup=navigation_keyboard(include_back=False)
-    )
+    await message.answer("🏠 Ви у головному меню.", reply_markup=navigation_keyboard(include_back=False))
     await message.answer("Оберіть дію:", reply_markup=main_menu())
 
 
@@ -249,7 +231,14 @@ class UserEditForm(StatesGroup):
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
 
-    await message.answer(WELCOME_MESSAGE, reply_markup=navigation_keyboard(include_back=False))
+    text = (
+        "🟥 <b>DC Link — Електронна черга постачальників</b>\n\n"
+        "👋 Вітаємо у електронній черзі постачальників\n"
+        "Цей бот допоможе створити заявку на вивантаження.\n\n"
+        "Натисніть кнопку нижче, щоб почати."
+    )
+
+    await message.answer(text, reply_markup=navigation_keyboard(include_back=False))
     await message.answer("Оберіть дію:", reply_markup=main_menu())
 
 
@@ -262,7 +251,7 @@ async def menu_new(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
 
     await callback.message.answer(
-        prettified_prompt("📦 Розпочнемо з назви постачальника."),
+        "📦 Введіть назву постачальника:",
         reply_markup=navigation_keyboard(include_back=False)
     )
 
@@ -283,15 +272,9 @@ async def menu_my(callback: types.CallbackQuery):
         rows = result.scalars().all()
 
     if not rows:
-        return await callback.message.answer(
-            prettified_prompt("🗒 У вас поки немає заявок. Створіть першу, щоб побачити історію."),
-            reply_markup=navigation_keyboard(include_back=False),
-        )
+        return await callback.message.answer("У вас немає заявок.")
 
-    text = (
-        "<b>📋 Останні 3 заявки</b>\n"
-        "Перегляньте деталі або змініть їх прямо тут.\n\n"
-    )
+    text = "<b>📋 Ваші останні 3 заявки:</b>\n\n"
     kb = InlineKeyboardBuilder()
     for req in rows:
         status = get_status_label(req.status)
