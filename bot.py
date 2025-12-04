@@ -120,7 +120,7 @@ async def init_db():
 #                     CONSTANTS & MENUS                       
 ###############################################################
 
-BACK_TEXT = "⬅️ Назад"
+BACK_TEXT = "↩️ Назад"
 MAIN_MENU_TEXT = "🏠 Головне меню"
 
 
@@ -141,8 +141,15 @@ def add_inline_navigation(builder: InlineKeyboardBuilder, back_callback: str | N
 
 async def show_main_menu(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("🏠 Ви у головному меню.", reply_markup=navigation_keyboard(include_back=False))
-    await message.answer("Оберіть дію:", reply_markup=main_menu())
+    await message.answer(
+        "<b>🏠 DC Link | Головне меню</b>\n"
+        "Оберіть, що зробити просто зараз:",
+        reply_markup=navigation_keyboard(include_back=False),
+    )
+    await message.answer(
+        "📍 Керування доступними розділами:",
+        reply_markup=main_menu(),
+    )
 
 
 @dp.message(F.text == MAIN_MENU_TEXT)
@@ -156,9 +163,9 @@ async def handle_main_menu_callback(callback: types.CallbackQuery, state: FSMCon
 
 def main_menu():
     kb = InlineKeyboardBuilder()
-    kb.button(text="▶️ Створити заявку", callback_data="menu_new")
-    kb.button(text="📋 Мій список заявок", callback_data="menu_my")
-    kb.button(text="⚙️ Адмін-панель", callback_data="menu_admin")
+    kb.button(text="📝 Нова заявка", callback_data="menu_new")
+    kb.button(text="📂 Мої останні заявки", callback_data="menu_my")
+    kb.button(text="🛠 Адмін-панель", callback_data="menu_admin")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -231,15 +238,18 @@ class UserEditForm(StatesGroup):
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
 
-    text = (
-        "🟥 <b>DC Link — Електронна черга постачальників</b>\n\n"
-        "👋 Вітаємо у електронній черзі постачальників\n"
-        "Цей бот допоможе створити заявку на вивантаження.\n\n"
-        "Натисніть кнопку нижче, щоб почати."
+    hero = (
+        "<b>🚀 DC Link | Електронна черга постачальників</b>\n"
+        "Працюємо у корпоративному стилі: швидко, чітко, без зайвого шуму.\n\n"
+        "• Створіть заявку за лічені кроки\n"
+        "• Отримуйте статуси та рішення\n"
+        "• Керуйте останніми заявками прямо з бота"
     )
 
-    await message.answer(text, reply_markup=navigation_keyboard(include_back=False))
-    await message.answer("Оберіть дію:", reply_markup=main_menu())
+    await message.answer(hero, reply_markup=navigation_keyboard(include_back=False))
+    await message.answer(
+        "Готові працювати? Оберіть розділ нижче:", reply_markup=main_menu()
+    )
 
 
 ###############################################################
@@ -272,9 +282,14 @@ async def menu_my(callback: types.CallbackQuery):
         rows = result.scalars().all()
 
     if not rows:
-        return await callback.message.answer("У вас немає заявок.")
+        return await callback.message.answer(
+            "📂 Поки немає заявок. Створіть першу, щоб розпочати роботу."
+        )
 
-    text = "<b>📋 Ваші останні 3 заявки:</b>\n\n"
+    text = (
+        "<b>📂 Останні 3 заявки</b>\n"
+        "Швидкий доступ до актуальних звернень:\n\n"
+    )
     kb = InlineKeyboardBuilder()
     for req in rows:
         status = get_status_label(req.status)
@@ -296,10 +311,10 @@ async def menu_my(callback: types.CallbackQuery):
 
 def get_status_label(status: str) -> str:
     return {
-        "new": "🟢 Нова",
-        "approved": "✔ Підтверджена",
+        "new": "🟢 На розгляді",
+        "approved": "✅ Підтверджена",
         "rejected": "❌ Відхилена",
-        "deleted_by_user": "⛔ Видалена користувачем",
+        "deleted_by_user": "⛔ Скасована користувачем",
     }.get(status, status)
 
 
@@ -307,10 +322,11 @@ def format_request_text(req: Request) -> str:
     status = get_status_label(req.status)
     return (
         f"<b>📄 Заявка #{req.id}</b>\n"
-        f"Статус: {status}\n\n"
+        f"Статус: {status}\n"
+        "━━━━━━━━━━━━━━━━\n"
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
         f"👤 <b>Водій:</b> {req.driver_name}\n"
-        f"📞 <b>Телефон:</b> {req.phone}\n"
+        f"📞 <b>Контакт:</b> {req.phone}\n"
         f"🚚 <b>Авто:</b> {req.car}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>Дата:</b> {req.date.strftime('%d.%m.%Y')}\n"
@@ -952,7 +968,10 @@ async def menu_admin_handler(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
     if user_id == SUPERADMIN_ID:
-        return await callback.message.answer("⚙️ <b>Адмін-панель:</b>", reply_markup=admin_menu())
+        return await callback.message.answer(
+            "🛠 <b>Адмін-панель</b>\nКеруйте заявками та доступами:",
+            reply_markup=admin_menu(),
+        )
 
     async with SessionLocal() as session:
         res = await session.execute(select(Admin).where(Admin.telegram_id == user_id))
@@ -961,7 +980,10 @@ async def menu_admin_handler(callback: types.CallbackQuery):
     if not admin:
         return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
 
-    await callback.message.answer("⚙️ <b>Адмін-панель:</b>", reply_markup=admin_menu())
+    await callback.message.answer(
+        "🛠 <b>Адмін-панель</b>\nКеруйте заявками та доступами:",
+        reply_markup=admin_menu(),
+    )
 
 
 ###############################################################
@@ -980,9 +1002,11 @@ async def admin_new(callback: types.CallbackQuery):
         rows = res.scalars().all()
 
     if not rows:
-        return await callback.message.answer("🟢 Немає нових заявок.")
+        return await callback.message.answer(
+            "🟢 Нових заявок немає. Усі звернення оброблені."
+        )
 
-    text = "<b>🆕 Нові заявки:</b>\n\n"
+    text = "<b>🆕 Нові заявки</b>\nОстанні звернення, що очікують рішення:\n\n"
     for r in rows:
         text += (
             f"• <b>#{r.id}</b> — "
@@ -1008,9 +1032,9 @@ async def admin_all(callback: types.CallbackQuery):
         rows = res.scalars().all()
 
     if not rows:
-        return await callback.message.answer("⚪ Немає заявок в базі.")
+        return await callback.message.answer("⚪ У базі ще немає заявок.")
 
-    text = "<b>📚 Останні 20 заявок:</b>\n\n"
+    text = "<b>📚 Останні 20 заявок</b>\nШвидка навігація по архіву:\n\n"
     kb = InlineKeyboardBuilder()
     for r in rows:
         status = "🟢 NEW" if r.status == "new" else f"⚪ {get_status_label(r.status)}"
@@ -1205,17 +1229,19 @@ async def admin_clear_no(callback: types.CallbackQuery):
 @dp.message(QueueForm.supplier)
 async def step_supplier(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
-        return await message.answer("Ви на початку анкети. Користуйтеся кнопками нижче.")
+        return await message.answer(
+            "ℹ️ Ви на початку анкети. Використовуйте кнопки навігації."
+        )
         
     supplier = message.text.strip()
 
     if not supplier:
-        return await message.answer("⚠ Введіть постачальника.")
+        return await message.answer("⚠️ Вкажіть назву постачальника, щоб продовжити.")
 
     await state.update_data(supplier=supplier)
 
     await message.answer(
-        "🚛 Введіть ПІБ водія:",
+        "👤 <b>Крок 2/7</b>\nВведіть ПІБ водія:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.driver_name)
@@ -1226,17 +1252,20 @@ async def step_driver_name(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.supplier)
         return await message.answer(
-            "📦 Введіть постачальника:",
+            "🏢 <b>Крок 1/7</b>\nВкажіть назву постачальника:",
             reply_markup=navigation_keyboard(include_back=False)
         )
 
     name = message.text.strip()
     if not name:
-        return await message.answer("⚠ Введіть ПІБ водія.")
+        return await message.answer("⚠️ Потрібно вказати ПІБ водія.")
 
     await state.update_data(driver_name=name)
 
-    await message.answer("📞 Введіть номер телефону:", reply_markup=navigation_keyboard())
+    await message.answer(
+        "📞 <b>Крок 3/7</b>\nЗалиште контактний номер телефону:",
+        reply_markup=navigation_keyboard()
+    )
     await state.set_state(QueueForm.phone)
 
 
@@ -1245,17 +1274,20 @@ async def step_phone(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.driver_name)
         return await message.answer(
-            "🚛 Введіть ПІБ водія:",
+            "👤 <b>Крок 2/7</b>\nВведіть ПІБ водія:",
             reply_markup=navigation_keyboard()
         )
 
     phone = message.text.strip()
     if not phone:
-        return await message.answer("⚠ Введіть номер телефону.")
+        return await message.answer("⚠️ Вкажіть номер телефону для зв'язку.")
 
     await state.update_data(phone=phone)
 
-    await message.answer("🚚 Введіть марку і номер авто:", reply_markup=navigation_keyboard())
+    await message.answer(
+        "🚚 <b>Крок 4/7</b>\nВведіть марку та номер авто:",
+        reply_markup=navigation_keyboard()
+    )
     await state.set_state(QueueForm.car)
 
 
@@ -1264,13 +1296,13 @@ async def step_car(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.phone)
         return await message.answer(
-            "📞 Введіть номер телефону:",
+            "📞 <b>Крок 3/7</b>\nЗалиште контактний номер телефону:",
             reply_markup=navigation_keyboard()
         )
 
     car = message.text.strip()
     if not car:
-        return await message.answer("⚠ Введіть марку та номер авто.")
+        return await message.answer("⚠️ Вкажіть марку та номер авто.")
 
     await state.update_data(car=car)
 
@@ -1280,7 +1312,7 @@ async def step_car(message: types.Message, state: FSMContext):
     kb.adjust(1)
 
     await message.answer(
-        "📋 Завантажте фото документів або пропустіть:",
+        "📎 <b>Крок 5/7</b>\nДодайте фото документів або пропустіть:",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
     )
 
@@ -1291,7 +1323,9 @@ async def step_car(message: types.Message, state: FSMContext):
 
 @dp.callback_query(QueueForm.docs, F.data == "photo_upload")
 async def photo_upload(callback: types.CallbackQuery):
-    await callback.message.answer("📸 Надішліть фото документів.")
+    await callback.message.answer(
+        "📸 Надішліть якісне фото документів (можна кілька)."
+    )
 
 @dp.callback_query(QueueForm.docs, F.data == "back_to_car")
 async def back_to_car(callback: types.CallbackQuery, state: FSMContext):
@@ -1307,7 +1341,7 @@ async def back_to_car(callback: types.CallbackQuery, state: FSMContext):
 async def docs_back(message: types.Message, state: FSMContext):
     await state.set_state(QueueForm.car)
     await message.answer(
-        "🚚 Введіть марку і номер авто:",
+        "🚚 <b>Крок 4/7</b>\nВведіть марку та номер авто:",
         reply_markup=navigation_keyboard()
     )
 
@@ -1323,7 +1357,7 @@ async def photo_received(message: types.Message, state: FSMContext):
     kb.adjust(1)
 
     await message.answer(
-        "Фото збережено.",
+        "✅ Фото додано. Продовжуємо оформлення.",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
     )
 
@@ -1338,7 +1372,7 @@ async def photo_done(callback: types.CallbackQuery, state: FSMContext):
     kb.adjust(1)
 
     await callback.message.answer(
-        "😉 Оберіть тип завантаження:",
+        "⚙️ <b>Крок 6/7</b>\nОберіть тип завантаження:",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_docs").as_markup()
     )
 
@@ -1353,7 +1387,7 @@ async def loading_back(callback: types.CallbackQuery, state: FSMContext):
 
     await state.set_state(QueueForm.docs)
     await callback.message.answer(
-        "📋 Завантажте документи або пропустіть:",
+        "📎 <b>Крок 5/7</b>\nДодайте фото документів або пропустіть:",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
     )
     await callback.answer()
@@ -1376,7 +1410,7 @@ async def step_loading(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(loading_type=t)
 
     await callback.message.answer(
-        "🔹 Оберіть дату:",
+        "📅 <b>Крок 7/7</b>\nОберіть дату та час візиту:",
         reply_markup=build_date_calendar(back_callback="back_to_loading")
     )
 
@@ -1522,7 +1556,9 @@ async def back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
         markup = build_date_calendar(back_callback="back_to_loading")
 
     await state.set_state(QueueForm.calendar)
-    await callback.message.answer("🔹 Оберіть дату:", reply_markup=markup)
+    await callback.message.answer(
+        "📅 <b>Крок 7/7</b>\nОберіть дату та час візиту:", reply_markup=markup
+    )
     await callback.answer()
 
 
@@ -1537,7 +1573,7 @@ async def hour_selected(callback: types.CallbackQuery, state: FSMContext):
     kb.adjust(6)
 
     await callback.message.answer(
-        "🕒 Оберіть хвилини:",
+        "🕒 Оберіть хвилини прибуття:",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_hour").as_markup()
     )
     await state.set_state(QueueForm.minute)
@@ -1569,8 +1605,9 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
         await session.refresh(req)
 
     await callback.message.answer(
-        f"✅ Заявку #{req.id} відправлено адміністратору!\n"
-        f"📅 {req.date.strftime('%d.%m.%Y')} ⏰ {req.time}"
+        f"✅ Заявка #{req.id} відправлена на розгляд.\n"
+        f"📅 {req.date.strftime('%d.%m.%Y')} • ⏰ {req.time}",
+        reply_markup=navigation_keyboard(include_back=False)
     )
 
     # Рассылка всем админам
@@ -1604,10 +1641,11 @@ async def broadcast_new_request(req_id: int):
         admins = (await session.execute(select(Admin))).scalars().all()
 
     text = (
-        f"<b>📦 Нова заявка #{req.id}</b>\n\n"
+        f"<b>🆕 Нова заявка #{req.id}</b>\n"
+        "━━━━━━━━━━━━━━━━\n"
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
         f"👤 <b>Водій:</b> {req.driver_name}\n"
-        f"📞 <b>Телефон:</b> {req.phone}\n"
+        f"📞 <b>Контакт:</b> {req.phone}\n"
         f"🚚 <b>Авто:</b> {req.car}\n"
         f"🧱 <b>Тип:</b> {req.loading_type}\n"
         f"📅 <b>Дата:</b> {req.date.strftime('%d.%m.%Y')}\n"
