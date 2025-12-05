@@ -23,6 +23,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     InlineKeyboardButton,
+    InputMediaPhoto,
 )
 
 from sqlalchemy.ext.asyncio import (
@@ -202,22 +203,34 @@ class GoogleSheetClient:
         return self._worksheet is not None
 
     def _build_row(self, req: Request) -> list[str]:
+        docs_present = bool(parse_doc_ids(req.docs_file_id))
+        admin_decision = req.status in {"approved", "rejected"}
+
+        if req.status == "approved" and req.date and req.time:
+            confirmed_date = req.date.strftime("%d.%m.%Y")
+            confirmed_time = req.time
+        elif req.status == "rejected":
+            confirmed_date = confirmed_time = "Отклонена"
+        else:
+            confirmed_date = confirmed_time = ""
+
         return [
             req.created_at.strftime("%d.%m.%Y %H:%M") if req.created_at else "",
-            req.updated_at.strftime("%d.%m.%Y %H:%M") if req.updated_at else "",
+            req.updated_at.strftime("%d.%m.%Y %H:%M") if admin_decision and req.updated_at else "",
             req.supplier,
             req.driver_name,
             req.car,
             req.phone,
-            "Да" if req.docs_file_id else "Нет",
+            "Да" if docs_present else "Нет",
             req.cargo_type or "",
             req.loading_type,
             req.planned_date.strftime("%d.%m.%Y") if req.planned_date else "",
             req.planned_time or "",
             get_sheet_status(req.status),
-            ("Отклонена" if req.status == "rejected" else req.date.strftime("%d.%m.%Y")) if req.date else "",
-            ("Отклонена" if req.status == "rejected" else req.time or "") if req.time else "",
+            confirmed_date,
+            confirmed_time,
             "Завершена" if req.completed_at else "Не завершена",
+            str(req.admin_id) if admin_decision and req.admin_id else "",
             req.completed_at.strftime("%d.%m.%Y %H:%M") if req.completed_at else "",
             str(req.id),
         ]
@@ -226,7 +239,7 @@ class GoogleSheetClient:
         try:
             await asyncio.to_thread(
                 self._worksheet.update,
-                f"A{row_number}:Q{row_number}",
+                f"A{row_number}:R{row_number}",
                 [values],
                 value_input_option="USER_ENTERED",
             )
@@ -300,7 +313,7 @@ class GoogleSheetClient:
             return
 
         try:
-            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:Q"])
+            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:R"])
         except Exception as exc:
             logging.exception("Не вдалося очистити таблицю Sheets: %s", exc)
 
@@ -545,6 +558,42 @@ def set_updated_now(req: Request):
     req.updated_at = datetime.utcnow()
 
 
+def parse_doc_ids(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        loaded = json.loads(raw)
+        if isinstance(loaded, list):
+            return [str(item) for item in loaded if str(item)]
+    except Exception:
+        pass
+    return [raw]
+
+
+def serialize_doc_ids(ids: list[str]) -> str | None:
+    clean_ids = [doc_id for doc_id in ids if doc_id]
+    return json.dumps(clean_ids) if clean_ids else None
+
+
+async def send_docs_and_text(
+    target_message: types.Message,
+    doc_ids: list[str],
+    text: str,
+    markup: types.InlineKeyboardMarkup | None = None,
+):
+    if not doc_ids:
+        await target_message.answer(text, reply_markup=markup)
+        return
+
+    if len(doc_ids) == 1:
+        await target_message.answer_photo(doc_ids[0], caption=text, reply_markup=markup)
+        return
+
+    media = [InputMediaPhoto(media=doc_id) for doc_id in doc_ids]
+    await target_message.answer_media_group(media)
+    await target_message.answer(text, reply_markup=markup)
+
+
 def get_confirmed_datetime(req: Request) -> datetime | None:
     if not req.date or not req.time:
         return None
@@ -577,10 +626,12 @@ async def send_request_details(
         else callback_or_message
     )
 
-    if req.docs_file_id:
-        await target_message.answer_photo(req.docs_file_id, caption=text, reply_markup=kb.as_markup())
-    else:
-        await target_message.answer(text, reply_markup=kb.as_markup())
+    await send_docs_and_text(
+        target_message,
+        parse_doc_ids(req.docs_file_id),
+        text,
+        markup=kb.as_markup(),
+    )
 
     if isinstance(callback_or_message, types.CallbackQuery):
         await callback_or_message.answer()
@@ -986,9 +1037,11 @@ async def user_edit_docs(message: types.Message, state: FSMContext):
     if not req:
         return await message.answer("Заявка не знайдена або вам не належить.")
 
-    old_value = "Додані" if req.docs_file_id else "Відсутні"
+    current_docs = parse_doc_ids(req.docs_file_id)
+    old_value = "Додані" if current_docs else "Відсутні"
     if message.photo:
-        req.docs_file_id = message.photo[-1].file_id
+        current_docs.append(message.photo[-1].file_id)
+        req.docs_file_id = serialize_doc_ids(current_docs)
         status_text = "Фото документів оновлено"
     elif message.text and message.text.lower().strip() == "без документів":
         req.docs_file_id = None
@@ -1004,7 +1057,7 @@ async def user_edit_docs(message: types.Message, state: FSMContext):
         req,
         reason or "",
         text=f"{status_text} для заявки #{req.id}.",
-        changes=[("Документи", old_value, "Додані" if req.docs_file_id else "Відсутні")],
+        changes=[("Документи", old_value, "Додані" if parse_doc_ids(req.docs_file_id) else "Відсутні")],
     )
 
 
@@ -1385,14 +1438,12 @@ async def admin_view(callback: types.CallbackQuery):
 
     text, markup = build_admin_request_view(req, is_superadmin)
 
-    if req.docs_file_id:
-        await callback.message.answer_photo(
-            req.docs_file_id,
-            caption=text,
-            reply_markup=markup,
-        )
-    else:
-        await callback.message.answer(text, reply_markup=markup)
+    await send_docs_and_text(
+        callback.message,
+        parse_doc_ids(req.docs_file_id),
+        text,
+        markup=markup,
+    )
 
     await callback.answer()
 
@@ -1439,10 +1490,12 @@ async def admin_search_wait(message: types.Message, state: FSMContext):
 
     text, markup = build_admin_request_view(req, is_superadmin)
 
-    if req.docs_file_id:
-        await message.answer_photo(req.docs_file_id, caption=text, reply_markup=markup)
-    else:
-        await message.answer(text, reply_markup=markup)
+    await send_docs_and_text(
+        message,
+        parse_doc_ids(req.docs_file_id),
+        text,
+        markup=markup,
+    )
 
     await state.clear()
 ###############################################################
@@ -1689,14 +1742,17 @@ async def docs_back(message: types.Message, state: FSMContext):
 @dp.message(QueueForm.docs, F.photo)
 async def photo_received(message: types.Message, state: FSMContext):
     file_id = message.photo[-1].file_id
-    await state.update_data(docs_file_id=file_id)
+    data = await state.get_data()
+    docs = data.get("docs_file_ids", [])
+    docs.append(file_id)
+    await state.update_data(docs_file_ids=docs)
 
     kb = InlineKeyboardBuilder()
     kb.button(text="⏭ Далі", callback_data="photo_done")
     kb.adjust(1)
 
     await message.answer(
-        "✅ Фото додано. Продовжуємо оформлення.",
+        "✅ Фото додано. Можете надіслати ще або натиснути 'Далі'.",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
     )
 
@@ -1952,7 +2008,7 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
             driver_name=data["driver_name"],
             phone=data["phone"],
             car=data["car"],
-            docs_file_id=data.get("docs_file_id"),
+            docs_file_id=serialize_doc_ids(data.get("docs_file_ids", [])),
             cargo_type=data.get("cargo_type"),
             loading_type=data["loading_type"],
             planned_date=data["date"],
@@ -2028,8 +2084,13 @@ async def broadcast_new_request(req_id: int):
 
         try:
             await bot.send_message(admin.telegram_id, text, reply_markup=kb.as_markup())
-            if req.docs_file_id:
-                await bot.send_photo(admin.telegram_id, req.docs_file_id)
+            doc_ids = parse_doc_ids(req.docs_file_id)
+            if doc_ids:
+                if len(doc_ids) == 1:
+                    await bot.send_photo(admin.telegram_id, doc_ids[0])
+                else:
+                    media = [InputMediaPhoto(media=doc_id) for doc_id in doc_ids]
+                    await bot.send_media_group(admin.telegram_id, media)
         except:
             pass
 ###############################################################
