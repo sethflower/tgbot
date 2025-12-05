@@ -191,13 +191,14 @@ class GoogleSheetClient:
             req.date.strftime("%d.%m.%Y"),
             req.time,
             get_sheet_status(req.status),
+            str(req.id),
         ]
 
     async def _update_row(self, row_number: int, values: list[str]) -> bool:
         try:
             await asyncio.to_thread(
                 self._worksheet.update,
-                f"A{row_number}:I{row_number}",
+                f"A{row_number}:J{row_number}",
                 [values],
                 value_input_option="USER_ENTERED",
             )
@@ -271,7 +272,7 @@ class GoogleSheetClient:
             return
 
         try:
-            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:I"])
+            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:J"])
         except Exception as exc:
             logging.exception("Не вдалося очистити таблицю Sheets: %s", exc)
 
@@ -336,6 +337,7 @@ def admin_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="🆕 Нові заявки", callback_data="admin_new")
     kb.button(text="📚 Усі заявки", callback_data="admin_all")
+    kb.button(text="🔎 Пошук за ID", callback_data="admin_search")
     kb.button(text="➕ Додати адміна", callback_data="admin_add")
     kb.button(text="➖ Видалити адміна", callback_data="admin_remove")
     kb.button(text="🗑 Очистити БД", callback_data="admin_clear")
@@ -362,6 +364,9 @@ class AdminAdd(StatesGroup):
     wait_id = State()
 
 class AdminRemove(StatesGroup):
+    wait_id = State()
+
+class AdminSearch(StatesGroup):
     wait_id = State()
 
 class AdminChangeForm(StatesGroup):
@@ -1239,6 +1244,31 @@ async def admin_all(callback: types.CallbackQuery):
     await callback.message.answer(text, reply_markup=kb.as_markup())
 
 
+def build_admin_request_view(req: Request, is_superadmin: bool):
+    status = get_status_label(req.status)
+    text = (
+        f"<b>📄 Заявка #{req.id}</b>\n"
+        f"Статус: {status}\n\n"
+        f"🏢 <b>Постачальник:</b> {req.supplier}\n"
+        f"👤 <b>Водій:</b> {req.driver_name}\n"
+        f"📞 <b>Телефон:</b> {req.phone}\n"
+        f"🚚 <b>Авто:</b> {req.car}\n"
+        f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
+        f"📅 <b>Дата:</b> {req.date.strftime('%d.%m.%Y')}\n"
+        f"⏰ <b>Час:</b> {req.time}"
+    )
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✔ Підтвердити", callback_data=f"adm_ok_{req.id}")
+    kb.button(text="🔁 Змінити дату/час", callback_data=f"adm_change_{req.id}")
+    kb.button(text="❌ Відхилити", callback_data=f"adm_rej_{req.id}")
+    if is_superadmin or req.status != "new":
+        kb.button(text="🗑 Видалити", callback_data=f"adm_del_{req.id}")
+    kb.button(text="⬅️ До списку", callback_data="admin_all")
+    kb.adjust(1)
+    kb = add_inline_navigation(kb)
+    return text, kb.as_markup()
+
+
 @dp.callback_query(F.data.startswith("admin_view_"))
 async def admin_view(callback: types.CallbackQuery):
     req_id = int(callback.data.split("_")[2])
@@ -1260,40 +1290,68 @@ async def admin_view(callback: types.CallbackQuery):
     if not (is_superadmin or admin):
         return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
 
-    status = get_status_label(req.status)
-
-    text = (
-        f"<b>📄 Заявка #{req.id}</b>\n"
-        f"Статус: {status}\n\n"
-        f"🏢 <b>Постачальник:</b> {req.supplier}\n"
-        f"👤 <b>Водій:</b> {req.driver_name}\n"
-        f"📞 <b>Телефон:</b> {req.phone}\n"
-        f"🚚 <b>Авто:</b> {req.car}\n"
-        f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
-        f"📅 <b>Дата:</b> {req.date.strftime('%d.%m.%Y')}\n"
-        f"⏰ <b>Час:</b> {req.time}"
-    )
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✔ Підтвердити", callback_data=f"adm_ok_{req.id}")
-    kb.button(text="🔁 Змінити дату/час", callback_data=f"adm_change_{req.id}")
-    kb.button(text="❌ Відхилити", callback_data=f"adm_rej_{req.id}")
-    if is_superadmin or req.status != "new":
-        kb.button(text="🗑 Видалити", callback_data=f"adm_del_{req.id}")
-    kb.button(text="⬅️ До списку", callback_data="admin_all")
-    kb.adjust(1)
-    kb = add_inline_navigation(kb)
+    text, markup = build_admin_request_view(req, is_superadmin)
 
     if req.docs_file_id:
         await callback.message.answer_photo(
             req.docs_file_id,
             caption=text,
-            reply_markup=kb.as_markup(),
+            reply_markup=markup,
         )
     else:
-        await callback.message.answer(text, reply_markup=kb.as_markup())
+        await callback.message.answer(text, reply_markup=markup)
 
     await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_search")
+async def admin_search_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer(
+        "Введіть ID заявки для пошуку:",
+        reply_markup=navigation_keyboard(),
+    )
+    await state.set_state(AdminSearch.wait_id)
+    await callback.answer()
+
+
+@dp.message(AdminSearch.wait_id)
+async def admin_search_wait(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.clear()
+        await message.answer("Пошук скасовано.", reply_markup=navigation_keyboard(include_back=False))
+        return await show_main_menu(message, state)
+
+    try:
+        req_id = int(message.text.strip())
+    except ValueError:
+        return await message.answer("Будь ласка, введіть числовий ID заявки.")
+
+    user_id = message.from_user.id
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        admin = (
+            await session.execute(
+                select(Admin).where(Admin.telegram_id == user_id)
+            )
+        ).scalar_one_or_none()
+
+    is_superadmin = user_id == SUPERADMIN_ID or (admin and admin.is_superadmin)
+
+    if not (is_superadmin or admin):
+        await state.clear()
+        return await message.answer("⛔ Ви не адміністратор.")
+
+    if not req:
+        return await message.answer("Заявка не знайдена.")
+
+    text, markup = build_admin_request_view(req, is_superadmin)
+
+    if req.docs_file_id:
+        await message.answer_photo(req.docs_file_id, caption=text, reply_markup=markup)
+    else:
+        await message.answer(text, reply_markup=markup)
+
+    await state.clear()
 ###############################################################
 #             ADMIN — ADD ADMIN (FSM Aiogram 3 OK)            
 ###############################################################
