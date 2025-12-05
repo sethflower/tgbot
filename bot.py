@@ -5,7 +5,6 @@
 ###############################################################
 
 import os
-import json
 import asyncio
 import logging
 from datetime import datetime, date, timedelta
@@ -33,11 +32,8 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import declarative_base
 from sqlalchemy import (
     Column, Integer, BigInteger, String, Boolean,
-    Date, Text, TIMESTAMP, select, delete, text, inspect
+    Date, Text, TIMESTAMP, select, delete
 )
-
-import gspread
-from google.oauth2.service_account import Credentials
 
 from dotenv import load_dotenv
 
@@ -51,9 +47,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPERADMIN_ID = int(os.getenv("SUPERADMIN_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-GOOGLE_SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
-
 
 if not all([BOT_TOKEN, SUPERADMIN_ID, DATABASE_URL]):
     raise RuntimeError("❌ ENV-переменные BOT_TOKEN / SUPERADMIN_ID / DATABASE_URL не установлены!")
@@ -112,8 +105,6 @@ class Request(Base):
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
     status = Column(String, default="new")
     admin_id = Column(BigInteger, nullable=True)
-    sheet_row = Column(Integer, nullable=True)
-
 
 
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -123,171 +114,10 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSe
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-       
-        def ensure_sheet_row_column(sync_conn):
-            inspector = inspect(sync_conn)
-            cols = [c["name"] for c in inspector.get_columns("requests")]
-            if "sheet_row" not in cols:
-                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN sheet_row INTEGER"))
-
-        await conn.run_sync(ensure_sheet_row_column)
-
-
-
 
 
 ###############################################################
 #                     CONSTANTS & MENUS                       
-
-#                        GOOGLE SHEETS
-###############################################################
-
-
-def get_sheet_status(status: str) -> str:
-    return {
-        "new": "Новая",
-        "approved": "Принятая",
-        "rejected": "Отклонённая",
-        "deleted_by_user": "Удалена",
-    }.get(status, status)
-
-
-class GoogleSheetClient:
-    def __init__(self):
-        self._worksheet = None
-        self._init_attempted = False
-
-    async def _ensure_client(self) -> bool:
-        if self._worksheet:
-            return True
-        if self._init_attempted:
-            return False
-
-        self._init_attempted = True
-
-        if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SPREADSHEET_ID:
-            logging.warning("Google Sheets не налаштовано: немає env GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_SPREADSHEET_ID")
-            return False
-
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-
-        try:
-            info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-            creds = Credentials.from_service_account_info(info, scopes=scopes)
-
-            def _init_ws():
-                client = gspread.authorize(creds)
-                return client.open_by_key(GOOGLE_SPREADSHEET_ID).sheet1
-
-            self._worksheet = await asyncio.to_thread(_init_ws)
-            logging.info("Google Sheets клієнт ініціалізовано")
-        except Exception as exc:
-            logging.exception("Не вдалося підключитися до Google Sheets: %s", exc)
-            self._worksheet = None
-
-        return self._worksheet is not None
-
-    def _build_row(self, req: Request) -> list[str]:
-        return [
-            req.supplier,
-            req.driver_name,
-            req.phone,
-            req.car,
-            "Да" if req.docs_file_id else "Нет",
-            req.loading_type,
-            req.date.strftime("%d.%m.%Y"),
-            req.time,
-            get_sheet_status(req.status),
-        ]
-
-    async def _update_row(self, row_number: int, values: list[str]) -> bool:
-        try:
-            await asyncio.to_thread(
-                self._worksheet.update,
-                f"A{row_number}:I{row_number}",
-                [values],
-                value_input_option="USER_ENTERED",
-            )
-            return True
-        except Exception as exc:
-            logging.exception("Не вдалося оновити рядок %s у Sheets: %s", row_number, exc)
-            return False
-
-    async def _append_row(self, values: list[str]) -> int | None:
-        try:
-            result = await asyncio.to_thread(
-                self._worksheet.append_row,
-                values,
-                value_input_option="USER_ENTERED",
-                table_range="A2",
-            )
-            updated_range = None
-            if isinstance(result, dict):
-                updated_range = result.get("updates", {}).get("updatedRange")
-
-            if updated_range:
-                first_cell = updated_range.split("!")[-1].split(":")[0]
-                row_digits = "".join(ch for ch in first_cell if ch.isdigit())
-                if row_digits.isdigit():
-                    return int(row_digits)
-
-            # fallback: запитати кількість заповнених рядків
-            values_count = await asyncio.to_thread(self._worksheet.get_all_values)
-            return len(values_count)
-        except Exception as exc:
-            logging.exception("Не вдалося додати рядок у Sheets: %s", exc)
-            return None
-
-    async def _store_row_number(self, req_id: int, row_number: int):
-        async with SessionLocal() as session:
-            req = await session.get(Request, req_id)
-            if not req:
-                return
-            req.sheet_row = row_number
-            await session.commit()
-
-    async def sync_request(self, req: Request):
-        if not await self._ensure_client():
-            return
-
-        values = self._build_row(req)
-
-        if req.sheet_row:
-            updated = await self._update_row(req.sheet_row, values)
-            if updated:
-                return
-
-        row_number = await self._append_row(values)
-        if row_number:
-            await self._store_row_number(req.id, row_number)
-
-    async def delete_request(self, req: Request):
-        if not await self._ensure_client():
-            return
-
-        if not req.sheet_row:
-            return
-
-        try:
-            await asyncio.to_thread(self._worksheet.delete_rows, req.sheet_row)
-        except Exception as exc:
-            logging.exception("Не вдалося видалити рядок %s у Sheets: %s", req.sheet_row, exc)
-
-    async def clear_requests(self):
-        if not await self._ensure_client():
-            return
-
-        try:
-            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:I"])
-        except Exception as exc:
-            logging.exception("Не вдалося очистити таблицю Sheets: %s", exc)
-
-
-sheet_client = GoogleSheetClient()
-
-
-###############################################################
-#                     CONSTANTS & MENUS
 ###############################################################
 
 BACK_TEXT = "↩️ Назад"
@@ -662,9 +492,6 @@ async def my_delete_reason(message: types.Message, state: FSMContext):
         await session.delete(req)
         await session.commit()
 
-    await sheet_client.delete_request(req)
-
-
     await notify_admins_about_user_deletion(req_data, reason)
     await message.answer(
         "Заявку видалено з бази. Адміністратори отримали повідомлення.",
@@ -754,7 +581,6 @@ async def finalize_user_edit_update(
 
     target = message_or_callback.message if isinstance(message_or_callback, types.CallbackQuery) else message_or_callback
     await target.answer(text, reply_markup=navigation_keyboard(include_back=False))
-    await sheet_client.sync_request(req)
     await notify_admins_about_user_edit(req, reason, changes)
     await state.clear()
     if isinstance(message_or_callback, types.CallbackQuery):
@@ -1408,8 +1234,6 @@ async def admin_clear_yes(callback: types.CallbackQuery):
         await session.execute(delete(Request))
         await session.commit()
 
-    await sheet_client.clear_requests()
-
     await callback.message.answer("🗑 Усі заявки видалено!")
 
 
@@ -1805,7 +1629,6 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
         f"📅 {req.date.strftime('%d.%m.%Y')} • ⏰ {req.time}",
         reply_markup=navigation_keyboard(include_back=False)
     )
-    await sheet_client.sync_request(req)
 
     # Рассылка всем админам
     await broadcast_new_request(req.id)
@@ -1878,16 +1701,12 @@ async def adm_ok(callback: types.CallbackQuery):
 
     await callback.message.answer("✔ Підтверджено!")
 
-    await sheet_client.sync_request(req)
-
     # Уведомление водителю
     await bot.send_message(
         req.user_id,
         f"🎉 <b>Заявка #{req.id} підтверджена!</b>\n"
         f"📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}"
     )
-    
-    
 
     # Уведомление всех админов
     await notify_admins_about_action(req, "підтверджена")
@@ -1904,8 +1723,6 @@ async def adm_rej(callback: types.CallbackQuery):
         await session.commit()
 
     await callback.message.answer("❌ Відхилено!")
-    
-    await sheet_client.sync_request(req)
 
     await bot.send_message(
         req.user_id,
@@ -1942,8 +1759,6 @@ async def adm_delete(callback: types.CallbackQuery):
 
         await session.delete(req)
         await session.commit()
-
-    await sheet_client.delete_request(req)
 
     await callback.message.answer("🗑 Заявку видалено з бази.")
     await callback.answer()
@@ -2078,8 +1893,6 @@ async def adm_min(callback: types.CallbackQuery, state: FSMContext):
         await session.commit()
 
     await callback.message.answer("🔁 Дата/час успішно змінені!")
-
-    await sheet_client.sync_request(req)
 
     # Уведомление водителю
     await bot.send_message(
