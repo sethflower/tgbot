@@ -2332,6 +2332,7 @@ async def adm_min(callback: types.CallbackQuery, state: FSMContext):
         req = await session.get(Request, req_id)
         req.date = new_date
         req.time = new_time
+        req.status = "approved"
         req.admin_id = callback.from_user.id
         set_updated_now(req)
         await session.commit()
@@ -2459,10 +2460,10 @@ async def _auto_close_tick():
         requests = res.scalars().all()
 
     for req in requests:
-        confirmed_dt = get_confirmed_datetime(req)
-        if not confirmed_dt:
+        approved_at = req.updated_at or req.created_at
+        if not approved_at:
             continue
-        if now >= confirmed_dt + timedelta(hours=20):
+        if now >= approved_at + timedelta(hours=20):
             await complete_request(req.id, auto=True)
             
 ###############################################################
