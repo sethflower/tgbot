@@ -612,7 +612,12 @@ async def send_request_details(
     recent_ids: set[int] | None = None,
 ):
     kb = InlineKeyboardBuilder()
-    if allow_actions and req.id in (recent_ids or set()) and req.status != "deleted_by_user":
+    if (
+        allow_actions
+        and req.id in (recent_ids or set())
+        and req.status != "deleted_by_user"
+        and not req.completed_at
+    ):
         kb.button(text="✏️ Змінити", callback_data=f"my_edit_{req.id}")
         kb.button(text="🗑 Видалити", callback_data=f"my_delete_{req.id}")
     kb.button(text="⬅️ Мої заявки", callback_data="menu_my")
@@ -687,6 +692,9 @@ async def my_delete(callback: types.CallbackQuery, state: FSMContext):
     if req.status == "deleted_by_user":
         return await callback.answer("Заявка вже видалена", show_alert=True)
 
+    if req.completed_at:
+        return await callback.answer("Заявка вже завершена, зміни неможливі", show_alert=True)
+
     await state.set_state(UserDeleteForm.reason)
     await state.update_data(req_id=req_id)
     await callback.message.answer(
@@ -748,6 +756,10 @@ async def my_delete_reason(message: types.Message, state: FSMContext):
             await state.clear()
             return await message.answer("Заявка не знайдена або вам не належить.")
 
+        if req.completed_at:
+            await state.clear()
+            return await message.answer("Заявка вже завершена, зміни неможливі.")
+
         req_data = {
             "id": req.id,
             "supplier": req.supplier,
@@ -793,6 +805,9 @@ async def my_edit(callback: types.CallbackQuery, state: FSMContext):
     if req.status == "deleted_by_user":
         return await callback.answer("Заявка вже видалена", show_alert=True)
 
+    if req.completed_at:
+        return await callback.answer("Заявка вже завершена, редагування неможливе", show_alert=True)
+
     await state.set_state(UserEditForm.reason)
     await state.update_data(req_id=req_id)
     await callback.message.answer(
@@ -828,6 +843,10 @@ async def my_edit_reason(message: types.Message, state: FSMContext):
         if not req or req.user_id != message.from_user.id:
             await state.clear()
             return await message.answer("Заявка не знайдена або вам не належить.")
+
+        if req.completed_at:
+            await state.clear()
+            return await message.answer("Заявка вже завершена, редагування неможливе.")
 
     await state.update_data(reason=reason)
     await state.set_state(UserEditForm.field_choice)
@@ -871,7 +890,7 @@ async def _load_request_for_edit(state: FSMContext, user_id: int) -> tuple[Reque
     async with SessionLocal() as session:
         req = await session.get(Request, req_id)
 
-    if not req or req.user_id != user_id:
+    if not req or req.user_id != user_id or req.completed_at:
         await state.clear()
         return None, None
 
