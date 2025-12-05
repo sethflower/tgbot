@@ -8,7 +8,7 @@ import os
 import json
 import asyncio
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dtime
 from typing import Any
 
 from aiogram import Bot, Dispatcher, types, F
@@ -103,15 +103,21 @@ class Request(Base):
     car = Column(Text)
 
     docs_file_id = Column(Text, nullable=True)
+    cargo_type = Column(Text)
     loading_type = Column(Text)
+
+    planned_date = Column(Date)
+    planned_time = Column(Text)
 
     date = Column(Date)
     time = Column(Text)
 
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
+    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
     status = Column(String, default="new")
     admin_id = Column(BigInteger, nullable=True)
     sheet_row = Column(Integer, nullable=True)
+    completed_at = Column(TIMESTAMP, nullable=True)
 
 
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -124,9 +130,24 @@ async def init_db():
 
         def ensure_sheet_row_column(sync_conn):
             inspector = inspect(sync_conn)
-            cols = [c["name"] for c in inspector.get_columns("requests")]
+            cols = {c["name"] for c in inspector.get_columns("requests")}
             if "sheet_row" not in cols:
                 sync_conn.execute(text("ALTER TABLE requests ADD COLUMN sheet_row INTEGER"))
+            if "cargo_type" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN cargo_type TEXT"))
+            if "planned_date" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN planned_date DATE"))
+            if "planned_time" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN planned_time TEXT"))
+            if "updated_at" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN updated_at TIMESTAMP"))
+            if "completed_at" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN completed_at TIMESTAMP"))
+
+            # backfill plan and timestamps for existing rows
+            sync_conn.execute(text("UPDATE requests SET planned_date = date WHERE planned_date IS NULL"))
+            sync_conn.execute(text("UPDATE requests SET planned_time = time WHERE planned_time IS NULL"))
+            sync_conn.execute(text("UPDATE requests SET updated_at = created_at WHERE updated_at IS NULL"))
 
         await conn.run_sync(ensure_sheet_row_column)
 
@@ -182,15 +203,22 @@ class GoogleSheetClient:
 
     def _build_row(self, req: Request) -> list[str]:
         return [
+            req.created_at.strftime("%d.%m.%Y %H:%M") if req.created_at else "",
+            req.updated_at.strftime("%d.%m.%Y %H:%M") if req.updated_at else "",
             req.supplier,
             req.driver_name,
-            req.phone,
             req.car,
+            req.phone,
             "Да" if req.docs_file_id else "Нет",
+            req.cargo_type or "",
             req.loading_type,
-            req.date.strftime("%d.%m.%Y"),
-            req.time,
+            req.planned_date.strftime("%d.%m.%Y") if req.planned_date else "",
+            req.planned_time or "",
             get_sheet_status(req.status),
+            ("Отклонена" if req.status == "rejected" else req.date.strftime("%d.%m.%Y")) if req.date else "",
+            ("Отклонена" if req.status == "rejected" else req.time or "") if req.time else "",
+            "Завершена" if req.completed_at else "Не завершена",
+            req.completed_at.strftime("%d.%m.%Y %H:%M") if req.completed_at else "",
             str(req.id),
         ]
 
@@ -198,7 +226,7 @@ class GoogleSheetClient:
         try:
             await asyncio.to_thread(
                 self._worksheet.update,
-                f"A{row_number}:J{row_number}",
+                f"A{row_number}:Q{row_number}",
                 [values],
                 value_input_option="USER_ENTERED",
             )
@@ -272,7 +300,7 @@ class GoogleSheetClient:
             return
 
         try:
-            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:J"])
+            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:Q"])
         except Exception as exc:
             logging.exception("Не вдалося очистити таблицю Sheets: %s", exc)
 
@@ -355,6 +383,7 @@ class QueueForm(StatesGroup):
     phone = State()
     car = State()
     docs = State()
+    cargo_type = State()
     loading_type = State()
     calendar = State()
     hour = State()
@@ -385,6 +414,7 @@ class UserEditForm(StatesGroup):
     driver_name = State()
     phone = State()
     car = State()
+    cargo_type = State()
     docs = State()
     loading_type = State()
     calendar = State()     # выбор даты
@@ -488,6 +518,9 @@ def get_status_label(status: str) -> str:
 
 def format_request_text(req: Request) -> str:
     status = get_status_label(req.status)
+    final_status = "Завершена" if req.completed_at else "Не завершена"
+    planned_date = req.planned_date.strftime('%d.%m.%Y') if req.planned_date else req.date.strftime('%d.%m.%Y')
+    planned_time = req.planned_time if req.planned_time else req.time
     return (
         f"<b>📄 Заявка #{req.id}</b>\n"
         f"Статус: {status}\n"
@@ -496,14 +529,30 @@ def format_request_text(req: Request) -> str:
         f"👤 <b>Водій:</b> {req.driver_name}\n"
         f"📞 <b>Контакт:</b> {req.phone}\n"
         f"🚚 <b>Авто:</b> {req.car}\n"
+        f"📦 <b>Тип вантажу:</b> {req.cargo_type}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
-        f"📅 <b>Дата:</b> {req.date.strftime('%d.%m.%Y')}\n"
-        f"⏰ <b>Час:</b> {req.time}"
+        f"📅 <b>План:</b> {planned_date} {planned_time}\n"
+        f"✅ <b>Підтверджено:</b> {req.date.strftime('%d.%m.%Y')} {req.time}\n"
+        f"🏁 <b>Статус завершення:</b> {final_status}"
     )
 
 
 def build_recent_request_ids(reqs: list[Request]) -> set[int]:
     return {req.id for req in reqs}
+
+
+def set_updated_now(req: Request):
+    req.updated_at = datetime.utcnow()
+
+
+def get_confirmed_datetime(req: Request) -> datetime | None:
+    if not req.date or not req.time:
+        return None
+    try:
+        hour, minute = [int(x) for x in req.time.split(":")[:2]]
+        return datetime.combine(req.date, dtime(hour=hour, minute=minute))
+    except Exception:
+        return None
 
 
 async def send_request_details(
@@ -606,6 +655,7 @@ async def notify_admins_about_user_deletion(req: Request | dict[str, Any], reaso
             "driver_name": req.driver_name,
             "phone": req.phone,
             "car": req.car,
+            "cargo_type": req.cargo_type,
             "loading_type": req.loading_type,
             "date": req.date,
             "time": req.time,
@@ -620,6 +670,7 @@ async def notify_admins_about_user_deletion(req: Request | dict[str, Any], reaso
         f"👤 {data['driver_name']}\n"
         f"📞 {data['phone']}\n"
         f"🚚 {data['car']}\n"
+        f"📦 {data['cargo_type']}\n"
         f"🧱 {data['loading_type']}\n"
         f"📅 {data['date'].strftime('%d.%m.%Y')} ⏰ {data['time']}"
     )
@@ -652,6 +703,7 @@ async def my_delete_reason(message: types.Message, state: FSMContext):
             "driver_name": req.driver_name,
             "phone": req.phone,
             "car": req.car,
+            "cargo_type": req.cargo_type,
             "loading_type": req.loading_type,
             "date": req.date,
             "time": req.time,
@@ -704,6 +756,7 @@ def build_user_edit_choice_keyboard():
     kb.button(text="👤 Водій", callback_data="edit_field_driver")
     kb.button(text="📞 Телефон", callback_data="edit_field_phone")
     kb.button(text="🚚 Авто", callback_data="edit_field_car")
+    kb.button(text="📦 Тип вантажу", callback_data="edit_field_cargo")
     kb.button(text="🧱 Тип завантаження", callback_data="edit_field_loading")
     kb.button(text="📄 Документи", callback_data="edit_field_docs")
     kb.button(text="📅 Дата та час", callback_data="edit_field_datetime")
@@ -744,6 +797,7 @@ async def finalize_user_edit_update(
 ):
     req.status = "new"
     req.admin_id = None
+    set_updated_now(req)
 
     async with SessionLocal() as session:
         session.add(req)
@@ -888,6 +942,35 @@ async def user_edit_car(message: types.Message, state: FSMContext):
     )
 
 
+@dp.message(UserEditForm.cargo_type)
+async def user_edit_cargo(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(UserEditForm.field_choice)
+        return await message.answer(
+            "Оберіть, що потрібно змінити у заявці:",
+            reply_markup=build_user_edit_choice_keyboard(),
+        )
+
+    value = message.text.strip()
+    if not value:
+        return await message.answer("Вкажіть тип вантажу.")
+
+    req, reason = await _load_request_for_edit(state, message.from_user.id)
+    if not req:
+        return await message.answer("Заявка не знайдена або вам не належить.")
+
+    old_value = req.cargo_type
+    req.cargo_type = value
+    await finalize_user_edit_update(
+        message,
+        state,
+        req,
+        reason or "",
+        text=f"Поле 'Тип вантажу' оновлено для заявки #{req.id}.",
+        changes=[("Тип вантажу", old_value, req.cargo_type)],
+    )
+
+
 @dp.message(UserEditForm.docs, F.text == BACK_TEXT)
 async def user_edit_docs_back(message: types.Message, state: FSMContext):
     await state.set_state(UserEditForm.field_choice)
@@ -977,6 +1060,7 @@ async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContex
         "driver": (UserEditForm.driver_name, "Введіть нове ім'я водія:"),
         "phone": (UserEditForm.phone, "Введіть новий номер телефону:"),
         "car": (UserEditForm.car, "Введіть нову марку і номер авто:"),
+        "cargo": (UserEditForm.cargo_type, "Вкажіть новий тип вантажу:"),
     }
 
     if choice in prompts:
@@ -1131,6 +1215,8 @@ async def user_edit_minute(callback: types.CallbackQuery, state: FSMContext):
     old_time = req.time
     req.date = data.get("new_date")
     req.time = f"{data['new_hour']}:{minute}"
+    req.planned_date = req.date
+    req.planned_time = req.time
 
     await finalize_user_edit_update(
         callback,
@@ -1246,6 +1332,9 @@ async def admin_all(callback: types.CallbackQuery):
 
 def build_admin_request_view(req: Request, is_superadmin: bool):
     status = get_status_label(req.status)
+    final_status = "Завершена" if req.completed_at else "Не завершена"
+    plan_date = req.planned_date.strftime('%d.%m.%Y') if req.planned_date else req.date.strftime('%d.%m.%Y')
+    plan_time = req.planned_time if req.planned_time else req.time
     text = (
         f"<b>📄 Заявка #{req.id}</b>\n"
         f"Статус: {status}\n\n"
@@ -1253,14 +1342,18 @@ def build_admin_request_view(req: Request, is_superadmin: bool):
         f"👤 <b>Водій:</b> {req.driver_name}\n"
         f"📞 <b>Телефон:</b> {req.phone}\n"
         f"🚚 <b>Авто:</b> {req.car}\n"
+        f"📦 <b>Тип вантажу:</b> {req.cargo_type}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
-        f"📅 <b>Дата:</b> {req.date.strftime('%d.%m.%Y')}\n"
-        f"⏰ <b>Час:</b> {req.time}"
+        f"📅 <b>План:</b> {plan_date} {plan_time}\n"
+        f"✅ <b>Підтверджено:</b> {req.date.strftime('%d.%m.%Y')} {req.time}\n"
+        f"🏁 <b>Завершення:</b> {final_status}"
     )
     kb = InlineKeyboardBuilder()
     kb.button(text="✔ Підтвердити", callback_data=f"adm_ok_{req.id}")
     kb.button(text="🔁 Змінити дату/час", callback_data=f"adm_change_{req.id}")
     kb.button(text="❌ Відхилити", callback_data=f"adm_rej_{req.id}")
+    if req.status == "approved" and not req.completed_at:
+        kb.button(text="🏁 Завершити поставку", callback_data=f"adm_finish_{req.id}")
     if is_superadmin or req.status != "new":
         kb.button(text="🗑 Видалити", callback_data=f"adm_del_{req.id}")
     kb.button(text="⬅️ До списку", callback_data="admin_all")
@@ -1487,7 +1580,7 @@ async def step_supplier(message: types.Message, state: FSMContext):
     await state.update_data(supplier=supplier)
 
     await message.answer(
-        "👤 <b>Крок 2/7</b>\nВведіть ПІБ водія:",
+        "👤 <b>Крок 2/8</b>\nВведіть ПІБ водія:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.driver_name)
@@ -1498,7 +1591,7 @@ async def step_driver_name(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.supplier)
         return await message.answer(
-            "🏢 <b>Крок 1/7</b>\nВкажіть назву постачальника:",
+            "🏢 <b>Крок 1/8</b>\nВкажіть назву постачальника:",
             reply_markup=navigation_keyboard(include_back=False)
         )
 
@@ -1509,7 +1602,7 @@ async def step_driver_name(message: types.Message, state: FSMContext):
     await state.update_data(driver_name=name)
 
     await message.answer(
-        "📞 <b>Крок 3/7</b>\nЗалиште контактний номер телефону:",
+        "📞 <b>Крок 3/8</b>\nЗалиште контактний номер телефону:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.phone)
@@ -1520,7 +1613,7 @@ async def step_phone(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.driver_name)
         return await message.answer(
-            "👤 <b>Крок 2/7</b>\nВведіть ПІБ водія:",
+            "👤 <b>Крок 2/8</b>\nВведіть ПІБ водія:",
             reply_markup=navigation_keyboard()
         )
 
@@ -1531,7 +1624,7 @@ async def step_phone(message: types.Message, state: FSMContext):
     await state.update_data(phone=phone)
 
     await message.answer(
-        "🚚 <b>Крок 4/7</b>\nВведіть марку та номер авто:",
+        "🚚 <b>Крок 4/8</b>\nВведіть марку та номер авто:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.car)
@@ -1542,7 +1635,7 @@ async def step_car(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.phone)
         return await message.answer(
-            "📞 <b>Крок 3/7</b>\nЗалиште контактний номер телефону:",
+            "📞 <b>Крок 3/8</b>\nЗалиште контактний номер телефону:",
             reply_markup=navigation_keyboard()
         )
 
@@ -1558,7 +1651,7 @@ async def step_car(message: types.Message, state: FSMContext):
     kb.adjust(1)
 
     await message.answer(
-        "📎 <b>Крок 5/7</b>\nДодайте фото документів або пропустіть:",
+        "📎 <b>Крок 5/8</b>\nДодайте фото документів або пропустіть:",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
     )
 
@@ -1587,7 +1680,7 @@ async def back_to_car(callback: types.CallbackQuery, state: FSMContext):
 async def docs_back(message: types.Message, state: FSMContext):
     await state.set_state(QueueForm.car)
     await message.answer(
-        "🚚 <b>Крок 4/7</b>\nВведіть марку та номер авто:",
+        "🚚 <b>Крок 4/8</b>\nВведіть марку та номер авто:",
         reply_markup=navigation_keyboard()
     )
 
@@ -1612,36 +1705,57 @@ async def photo_received(message: types.Message, state: FSMContext):
 @dp.callback_query(QueueForm.docs, F.data == "photo_done")
 async def photo_done(callback: types.CallbackQuery, state: FSMContext):
 
+    await callback.message.answer(
+        "📦 <b>Крок 6/8</b>\nВкажіть тип вантажу:",
+        reply_markup=navigation_keyboard()
+    )
+
+    await state.set_state(QueueForm.cargo_type)
+
+
+@dp.message(QueueForm.cargo_type)
+async def step_cargo_type(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="📸 Завантажити фото документів", callback_data="photo_upload")
+        kb.button(text="⏭ Пропустити", callback_data="photo_skip")
+        kb.adjust(1)
+        await state.set_state(QueueForm.docs)
+        return await message.answer(
+            "📎 <b>Крок 5/8</b>\nДодайте фото документів або пропустіть:",
+            reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup(),
+        )
+
+    cargo = message.text.strip()
+    if not cargo:
+        return await message.answer("Вкажіть тип вантажу, щоб продовжити.")
+
+    await state.update_data(cargo_type=cargo)
+
     kb = InlineKeyboardBuilder()
     kb.button(text="🚚 На палетах", callback_data="type_pal")
     kb.button(text="📦 В розсип", callback_data="type_loose")
     kb.adjust(1)
 
-    await callback.message.answer(
-        "⚙️ <b>Крок 6/7</b>\nОберіть тип завантаження:",
-        reply_markup=add_inline_navigation(kb, back_callback="back_to_docs").as_markup()
+    await message.answer(
+        "⚙️ <b>Крок 7/8</b>\nОберіть тип завантаження:",
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_cargo").as_markup(),
     )
 
     await state.set_state(QueueForm.loading_type)
 
-@dp.callback_query(QueueForm.loading_type, F.data == "back_to_docs")
+@dp.callback_query(QueueForm.loading_type, F.data == "back_to_cargo")
 async def loading_back(callback: types.CallbackQuery, state: FSMContext):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📸 Завантажити документи", callback_data="photo_upload")
-    kb.button(text="⏭ Пропустити", callback_data="photo_skip")
-    kb.adjust(1)
-
-    await state.set_state(QueueForm.docs)
+    await state.set_state(QueueForm.cargo_type)
     await callback.message.answer(
-        "📎 <b>Крок 5/7</b>\nДодайте фото документів або пропустіть:",
-        reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
+        "📦 <b>Крок 6/8</b>\nВкажіть тип вантажу:",
+        reply_markup=navigation_keyboard(),
     )
     await callback.answer()
 
 
-
 ###############################################################
-#                 LOADING TYPE → DATE                         
+#                 LOADING TYPE → DATE
 ###############################################################
 
 @dp.callback_query(QueueForm.loading_type)
@@ -1656,7 +1770,7 @@ async def step_loading(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(loading_type=t)
 
     await callback.message.answer(
-        "📅 <b>Крок 7/7</b>\nОберіть дату та час візиту:",
+        "📅 <b>Крок 8/8</b>\nОберіть дату та час візиту:",
         reply_markup=build_date_calendar(back_callback="back_to_loading")
     )
 
@@ -1759,7 +1873,7 @@ async def cal_back_to_loading(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(QueueForm.loading_type)
     await callback.message.answer(
         "🔹 Оберіть тип завантаження:",
-        reply_markup=add_inline_navigation(kb, back_callback="back_to_docs").as_markup()
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_cargo").as_markup()
     )
     await callback.answer()
 
@@ -1803,7 +1917,7 @@ async def back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
 
     await state.set_state(QueueForm.calendar)
     await callback.message.answer(
-        "📅 <b>Крок 7/7</b>\nОберіть дату та час візиту:", reply_markup=markup
+        "📅 <b>Крок 8/8</b>\nОберіть дату та час візиту:", reply_markup=markup
     )
     await callback.answer()
 
@@ -1839,11 +1953,15 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
             phone=data["phone"],
             car=data["car"],
             docs_file_id=data.get("docs_file_id"),
+            cargo_type=data.get("cargo_type"),
             loading_type=data["loading_type"],
+            planned_date=data["date"],
+            planned_time=f"{data['hour']}:{minute}",
             date=data["date"],
             time=f"{data['hour']}:{minute}",
             status="new",
-            created_at=datetime.utcnow()
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
         )
 
         session.add(req)
@@ -1895,9 +2013,10 @@ async def broadcast_new_request(req_id: int):
         f"👤 <b>Водій:</b> {req.driver_name}\n"
         f"📞 <b>Контакт:</b> {req.phone}\n"
         f"🚚 <b>Авто:</b> {req.car}\n"
-        f"🧱 <b>Тип:</b> {req.loading_type}\n"
-        f"📅 <b>Дата:</b> {req.date.strftime('%d.%m.%Y')}\n"
-        f"⏰ <b>Час:</b> {req.time}\n"
+        f"📦 <b>Тип вантажу:</b> {req.cargo_type}\n"
+        f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
+        f"📅 <b>План:</b> {req.planned_date.strftime('%d.%m.%Y')}\n"
+        f"⏰ <b>Час:</b> {req.planned_time}\n"
     )
 
     for admin in admins:
@@ -1925,6 +2044,7 @@ async def adm_ok(callback: types.CallbackQuery):
         req = await session.get(Request, req_id)
         req.status = "approved"
         req.admin_id = callback.from_user.id
+        set_updated_now(req)
         await session.commit()
 
     await callback.message.answer("✔ Підтверджено!")
@@ -1950,6 +2070,7 @@ async def adm_rej(callback: types.CallbackQuery):
         req = await session.get(Request, req_id)
         req.status = "rejected"
         req.admin_id = callback.from_user.id
+        set_updated_now(req)
         await session.commit()
 
     await callback.message.answer("❌ Відхилено!")
@@ -1962,6 +2083,33 @@ async def adm_rej(callback: types.CallbackQuery):
     )
 
     await notify_admins_about_action(req, "відхилена")
+
+
+@dp.callback_query(F.data.startswith("adm_finish_"))
+async def adm_finish(callback: types.CallbackQuery):
+    req_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
+    async with SessionLocal() as session:
+        admin = (
+            await session.execute(
+                select(Admin).where(Admin.telegram_id == user_id)
+            )
+        ).scalar_one_or_none()
+
+    is_superadmin = user_id == SUPERADMIN_ID or (admin and admin.is_superadmin)
+    if not (is_superadmin or admin):
+        return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
+
+    req = await complete_request(req_id, auto=False)
+    if not req:
+        return await callback.answer(
+            "Не можна завершити: заявка не підтверджена або вже завершена.",
+            show_alert=True,
+        )
+
+    await callback.message.answer("🏁 Заявка позначена як завершена.")
+    await callback.answer()
 @dp.callback_query(F.data.startswith("adm_del_"))
 async def adm_delete(callback: types.CallbackQuery):
     req_id = int(callback.data.split("_")[2])
@@ -2124,6 +2272,7 @@ async def adm_min(callback: types.CallbackQuery, state: FSMContext):
         req.date = new_date
         req.time = new_time
         req.admin_id = callback.from_user.id
+        set_updated_now(req)
         await session.commit()
 
     await callback.message.answer("🔁 Дата/час успішно змінені!")
@@ -2151,11 +2300,16 @@ async def notify_admins_about_action(req: Request, action: str):
     async with SessionLocal() as session:
         admins = (await session.execute(select(Admin))).scalars().all()
 
+    final_status = "Завершена" if req.completed_at else "Не завершена"
     text = (
         f"ℹ️ <b>Заявка #{req.id} {action}</b>\n\n"
         f"📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}\n"
         f"👤 {req.driver_name}\n"
-        f"🏢 {req.supplier}"
+        f"🏢 {req.supplier}\n"
+        f"🚚 {req.car}\n"
+        f"📦 {req.cargo_type}\n"
+        f"🧱 {req.loading_type}\n"
+        f"🏁 {final_status}"
     )
 
     for a in admins:
@@ -2188,6 +2342,67 @@ async def notify_admins_about_user_edit(
             await bot.send_message(admin.telegram_id, text)
         except:
             pass
+
+
+###############################################################
+#                 COMPLETE & AUTO-CLOSE REQUESTS
+###############################################################
+
+COMPLETION_MESSAGE = (
+    "Заявка #{} завершена. Гарної Вам дороги та дякую за співпрацю."
+)
+
+
+async def complete_request(req_id: int, *, auto: bool = False) -> Request | None:
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.completed_at or req.status != "approved":
+            return None
+
+        req.completed_at = datetime.utcnow()
+        set_updated_now(req)
+        await session.commit()
+        await session.refresh(req)
+
+    await sheet_client.sync_request(req)
+
+    try:
+        await bot.send_message(req.user_id, COMPLETION_MESSAGE.format(req.id))
+    except Exception:
+        pass
+
+    await notify_admins_about_action(
+        req, "завершена автоматично" if auto else "завершена"
+    )
+    return req
+
+
+async def auto_close_overdue_requests():
+    while True:
+        try:
+            await _auto_close_tick()
+        except Exception as exc:
+            logging.exception("Помилка автозакриття заявок: %s", exc)
+        await asyncio.sleep(300)
+
+
+async def _auto_close_tick():
+    now = datetime.utcnow()
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(Request).where(
+                Request.status == "approved",
+                Request.completed_at.is_(None),
+            )
+        )
+        requests = res.scalars().all()
+
+    for req in requests:
+        confirmed_dt = get_confirmed_datetime(req)
+        if not confirmed_dt:
+            continue
+        if now >= confirmed_dt + timedelta(hours=20):
+            await complete_request(req.id, auto=True)
             
 ###############################################################
 #                         BOT STARTUP                         
@@ -2205,6 +2420,7 @@ async def main():
             session.add(Admin(telegram_id=SUPERADMIN_ID, is_superadmin=True))
             await session.commit()
 
+    asyncio.create_task(auto_close_overdue_requests())
     print("Bot started!")
     await dp.start_polling(bot)
 
