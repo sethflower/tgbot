@@ -1063,12 +1063,25 @@ async def user_edit_day(callback: types.CallbackQuery, state: FSMContext):
     _, y, m, d = callback.data.split("_")
     chosen = date(int(y), int(m), int(d))
 
+    if chosen < kyiv_now().date():
+        return await callback.answer("Не можна обирати минулі дати", show_alert=True)
+
     await state.update_data(new_date=chosen)
 
     kb = InlineKeyboardBuilder()
-    for hour in range(24):
+    hours = available_hours(chosen)
+    for hour in hours:
         kb.button(text=f"{hour:02d}", callback_data=f"uhour_{hour:02d}")
     kb.adjust(6)
+
+    if not hours:
+        await callback.message.answer(
+            "На цю дату немає доступних часових слотів. Оберіть іншу дату.",
+            reply_markup=add_inline_navigation(
+                InlineKeyboardBuilder(), back_callback="edit_back_to_calendar"
+            ).as_markup(),
+        )
+        return await callback.answer()
 
     await state.set_state(UserEditForm.hour)
     await callback.message.answer(
@@ -1098,10 +1111,20 @@ async def user_edit_back_to_calendar(callback: types.CallbackQuery, state: FSMCo
 @dp.callback_query(UserEditForm.hour, F.data.startswith("uhour_"))
 async def user_edit_hour(callback: types.CallbackQuery, state: FSMContext):
     hour = callback.data.replace("uhour_", "")
+    data = await state.get_data()
+    chosen_date: date | None = data.get("new_date")
+
+    if not chosen_date:
+        return await callback.answer("Оберіть дату", show_alert=True)
+
+    valid_hours = {f"{h:02d}" for h in available_hours(chosen_date)}
+    if hour not in valid_hours:
+        return await callback.answer("Цей час вже недоступний", show_alert=True)
+
     await state.update_data(new_hour=hour)
 
     kb = InlineKeyboardBuilder()
-    for m in range(0, 60, 5):
+    for m in available_minutes(chosen_date, int(hour)):
         kb.button(text=f"{m:02d}", callback_data=f"umin_{m:02d}")
     kb.adjust(6)
 
@@ -1115,9 +1138,14 @@ async def user_edit_hour(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(UserEditForm.minute, F.data == "edit_back_to_hour")
 async def user_edit_back_to_hour(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    chosen_date: date | None = data.get("new_date")
+
     kb = InlineKeyboardBuilder()
-    for hour in range(24):
-        kb.button(text=f"{hour:02d}", callback_data=f"uhour_{hour:02d}")
+    if chosen_date:
+        hours = available_hours(chosen_date)
+        for hour in hours:
+            kb.button(text=f"{hour:02d}", callback_data=f"uhour_{hour:02d}")
     kb.adjust(6)
 
     await state.set_state(UserEditForm.hour)
@@ -1132,6 +1160,18 @@ async def user_edit_back_to_hour(callback: types.CallbackQuery, state: FSMContex
 async def user_edit_minute(callback: types.CallbackQuery, state: FSMContext):
     minute = callback.data.replace("umin_", "")
     data = await state.get_data()
+
+    chosen_date: date | None = data.get("new_date")
+    chosen_hour = data.get("new_hour")
+
+    if not chosen_date or chosen_date < kyiv_now().date():
+        return await callback.answer("Оберіть доступну дату", show_alert=True)
+
+    if chosen_hour is None:
+        return await callback.answer("Спочатку оберіть годину", show_alert=True)
+
+    if int(minute) not in available_minutes(chosen_date, int(chosen_hour)):
+        return await callback.answer("Цей час вже недоступний", show_alert=True)
 
     req, reason = await _load_request_for_edit(state, callback.from_user.id)
     if not req:
@@ -1653,11 +1693,12 @@ def build_date_calendar(year=None, month=None, back_callback: str | None = None)
     for d in range(1, days_in_month + 1):
         day_date = date(year, month, d)
         if day_date < today:
-            row.append(InlineKeyboardButton(text=str(d), callback_data="ignore"))
-        else:
-            row.append(
-                InlineKeyboardButton(text=str(d), callback_data=f"day_{year}_{month}_{d}")
-            )
+            # Пропускаємо минулі дати, щоб користувач їх не бачив
+            continue
+
+        row.append(
+            InlineKeyboardButton(text=str(d), callback_data=f"day_{year}_{month}_{d}")
+        )
         if len(row) == 7:
             kb.row(*row)
             row = []
@@ -1688,8 +1729,39 @@ def build_date_calendar(year=None, month=None, back_callback: str | None = None)
     return kb.as_markup()
 
 
+def available_minutes(selected_date: date, hour: int, *, now_dt: datetime | None = None) -> list[int]:
+    now_dt = now_dt or kyiv_now()
+
+    if hour < 9 or hour > 16:
+        return []
+
+    # Години роботи: 09:00–16:00, остання година без хвилинної градації
+    minutes = [0] if hour == 16 else list(range(0, 60, 5))
+
+    if selected_date == now_dt.date():
+        current_time = now_dt.time()
+        if hour < current_time.hour:
+            return []
+        if hour == current_time.hour:
+            minutes = [m for m in minutes if m >= current_time.minute]
+
+    return minutes
+
+
+def available_hours(selected_date: date, *, now_dt: datetime | None = None) -> list[int]:
+    now_dt = now_dt or kyiv_now()
+    hours = []
+
+    for hour in range(9, 17):
+        minutes = available_minutes(selected_date, hour, now_dt=now_dt)
+        if minutes:
+            hours.append(hour)
+
+    return hours
+
+
 ###############################################################
-#        DRIVER — DATE / HOUR / MINUTE SELECTION              
+#        DRIVER — DATE / HOUR / MINUTE SELECTION
 ###############################################################
 
 @dp.callback_query(QueueForm.calendar, F.data.startswith("prev_"))
@@ -1732,9 +1804,19 @@ async def cal_day(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(date=chosen)
 
     kb = InlineKeyboardBuilder()
-    for hour in range(9, 17):
+    hours = available_hours(chosen)
+    for hour in hours:
         kb.button(text=f"{hour:02d}", callback_data=f"hour_{hour:02d}")
     kb.adjust(6)
+
+    if not hours:
+        await callback.message.answer(
+            "На цю дату немає доступних часових слотів. Оберіть іншу дату.",
+            reply_markup=add_inline_navigation(
+                InlineKeyboardBuilder(), back_callback="back_to_calendar"
+            ).as_markup(),
+        )
+        return await callback.answer()
 
     await callback.message.answer(
         "⏰ Оберіть годину:",
@@ -1772,11 +1854,20 @@ async def back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(QueueForm.hour, F.data.startswith("hour_"))
 async def hour_selected(callback: types.CallbackQuery, state: FSMContext):
     hour = callback.data.replace("hour_", "")
+    data = await state.get_data()
+    chosen_date: date | None = data.get("date")
+
+    if not chosen_date:
+        return await callback.answer("Оберіть дату", show_alert=True)
+
+    valid_hours = {f"{h:02d}" for h in available_hours(chosen_date)}
+    if hour not in valid_hours:
+        return await callback.answer("Цей час вже недоступний", show_alert=True)
+
     await state.update_data(hour=hour)
 
     kb = InlineKeyboardBuilder()
-    minutes = [0] if hour == "16" else list(range(0, 60, 5))
-    for m in minutes:
+    for m in available_minutes(chosen_date, int(hour)):
         kb.button(text=f"{m:02d}", callback_data=f"min_{m:02d}")
     kb.adjust(6)
 
@@ -1803,8 +1894,8 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
         return await callback.answer("Спочатку оберіть годину", show_alert=True)
 
     selected_time = dtime(hour=int(chosen_hour), minute=int(minute))
-    if not (dtime(hour=9) <= selected_time <= dtime(hour=16)):
-        return await callback.answer("Доступний час з 09:00 до 16:00", show_alert=True)
+    if int(minute) not in available_minutes(chosen_date, int(chosen_hour)):
+        return await callback.answer("Цей час вже недоступний", show_alert=True)
 
     async with SessionLocal() as session:
         req = Request(
@@ -1841,9 +1932,14 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(QueueForm.minute, F.data == "back_to_hour")
 async def back_to_hour(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    chosen_date: date | None = data.get("date")
+
     kb = InlineKeyboardBuilder()
-    for hour in range(24):
-        kb.button(text=f"{hour:02d}", callback_data=f"hour_{hour:02d}")
+    if chosen_date:
+        hours = available_hours(chosen_date)
+        for hour in hours:
+            kb.button(text=f"{hour:02d}", callback_data=f"hour_{hour:02d}")
     kb.adjust(6)
 
     await state.set_state(QueueForm.hour)
@@ -2047,12 +2143,25 @@ async def adm_cal_day(callback: types.CallbackQuery, state: FSMContext):
     _, y, m, d = callback.data.split("_")
     chosen_date = date(int(y), int(m), int(d))
 
+    if chosen_date < kyiv_now().date():
+        return await callback.answer("Не можна обирати минулі дати", show_alert=True)
+
     await state.update_data(new_date=chosen_date)
 
     kb = InlineKeyboardBuilder()
-    for h in range(9, 17):
+    hours = available_hours(chosen_date)
+    for h in hours:
         kb.button(text=f"{h:02d}", callback_data=f"ach_hour_{h:02d}")
     kb.adjust(6)
+
+    if not hours:
+        await callback.message.answer(
+            "На цю дату немає доступних часових слотів. Оберіть іншу дату.",
+            reply_markup=add_inline_navigation(
+                InlineKeyboardBuilder(), back_callback="admin_back_to_calendar"
+            ).as_markup(),
+        )
+        return await callback.answer()
 
     await callback.message.answer(
         "⏰ Оберіть годину:",
@@ -2064,11 +2173,20 @@ async def adm_cal_day(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(AdminChangeForm.hour, F.data.startswith("ach_hour_"))
 async def adm_hour(callback: types.CallbackQuery, state: FSMContext):
     hour = callback.data.replace("ach_hour_", "")
+    data = await state.get_data()
+    chosen_date: date | None = data.get("new_date")
+
+    if not chosen_date:
+        return await callback.answer("Оберіть дату", show_alert=True)
+
+    valid_hours = {f"{h:02d}" for h in available_hours(chosen_date)}
+    if hour not in valid_hours:
+        return await callback.answer("Цей час вже недоступний", show_alert=True)
+
     await state.update_data(new_hour=hour)
 
     kb = InlineKeyboardBuilder()
-    minutes = [0] if hour == "16" else list(range(0, 60, 5))
-    for m in minutes:
+    for m in available_minutes(chosen_date, int(hour)):
         kb.button(text=f"{m:02d}", callback_data=f"ach_min_{m:02d}")
     kb.adjust(6)
 
@@ -2099,9 +2217,14 @@ async def admin_back_to_calendar(callback: types.CallbackQuery, state: FSMContex
 
 @dp.callback_query(AdminChangeForm.minute, F.data == "admin_back_to_hour")
 async def admin_back_to_hour(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    chosen_date: date | None = data.get("new_date")
+
     kb = InlineKeyboardBuilder()
-    for h in range(9, 17):
-        kb.button(text=f"{h:02d}", callback_data=f"ach_hour_{h:02d}")
+    if chosen_date:
+        hours = available_hours(chosen_date)
+        for h in hours:
+            kb.button(text=f"{h:02d}", callback_data=f"ach_hour_{h:02d}")
     kb.adjust(6)
 
     await state.set_state(AdminChangeForm.hour)
@@ -2121,14 +2244,18 @@ async def adm_min(callback: types.CallbackQuery, state: FSMContext):
     req_id = data["req_id"]
 
     new_date = data["new_date"]
-    new_time = f"{int(data['new_hour']):02d}:{int(minute):02d}"
+    new_hour = data.get("new_hour")
 
     if new_date < kyiv_now().date():
         return await callback.answer("Дата не може бути в минулому", show_alert=True)
 
-    chosen_time = dtime(hour=int(data["new_hour"]), minute=int(minute))
-    if not (dtime(hour=9) <= chosen_time <= dtime(hour=16)):
-        return await callback.answer("Доступний час з 09:00 до 16:00", show_alert=True)
+    if new_hour is None:
+        return await callback.answer("Спочатку оберіть годину", show_alert=True)
+
+    if int(minute) not in available_minutes(new_date, int(new_hour)):
+        return await callback.answer("Цей час вже недоступний", show_alert=True)
+
+    new_time = f"{int(new_hour):02d}:{int(minute):02d}"
 
     async with SessionLocal() as session:
         req = await session.get(Request, req_id)
