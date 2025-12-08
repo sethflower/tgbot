@@ -98,6 +98,7 @@ class Admin(Base):
 
     id = Column(Integer, primary_key=True)
     telegram_id = Column(BigInteger, unique=True, nullable=False)
+    last_name = Column(Text, nullable=False, default="")
     is_superadmin = Column(Boolean, default=False)
 
 
@@ -161,6 +162,19 @@ async def init_db():
 
         await conn.run_sync(ensure_sheet_row_column)
 
+        def ensure_admin_columns(sync_conn):
+            inspector = inspect(sync_conn)
+            cols = {c["name"] for c in inspector.get_columns("admins")}
+            if "last_name" not in cols:
+                sync_conn.execute(text("ALTER TABLE admins ADD COLUMN last_name TEXT"))
+                sync_conn.execute(
+                    text(
+                        "UPDATE admins SET last_name = CASE WHEN is_superadmin THEN 'Админ' ELSE '' END"
+                    )
+                )
+
+        await conn.run_sync(ensure_admin_columns)
+
 
 ###############################################################
 #                        GOOGLE SHEETS
@@ -211,7 +225,7 @@ class GoogleSheetClient:
 
         return self._worksheet is not None
 
-    def _build_row(self, req: Request) -> list[str]:
+    def _build_row(self, req: Request, admin_name: str) -> list[str]:
         admin_decision = req.status in {"approved", "rejected"}
 
         if req.status == "approved" and req.date and req.time:
@@ -235,7 +249,7 @@ class GoogleSheetClient:
             confirmed_date,
             confirmed_time,
             "Завершена" if req.completed_at else "Не завершена",
-            str(req.admin_id) if admin_decision and req.admin_id else "",
+            admin_name if admin_decision and admin_name else "",
             req.completed_at.strftime("%d.%m.%Y %H:%M") if req.completed_at else "",
             str(req.id),
         ]
@@ -290,7 +304,8 @@ class GoogleSheetClient:
         if not await self._ensure_client():
             return
 
-        values = self._build_row(req)
+        admin_name = await get_admin_display_name(req.admin_id)
+        values = self._build_row(req, admin_name)
 
         if req.sheet_row:
             updated = await self._update_row(req.sheet_row, values)
@@ -403,6 +418,25 @@ async def is_super_admin_user(user_id: int) -> bool:
     return bool(admin and admin.is_superadmin)
 
 
+async def get_admin_display_name(admin_id: int | None) -> str:
+    if not admin_id:
+        return ""
+    if admin_id == SUPERADMIN_ID:
+        return "Админ"
+
+    async with SessionLocal() as session:
+        res = await session.execute(select(Admin).where(Admin.telegram_id == admin_id))
+        admin = res.scalar_one_or_none()
+
+    if admin and admin.last_name:
+        return admin.last_name
+
+    if admin:
+        return "Адміністратор"
+
+    return ""
+
+
 ###############################################################
 #                        FSM STATES                           
 ###############################################################
@@ -418,6 +452,7 @@ class QueueForm(StatesGroup):
 
 class AdminAdd(StatesGroup):
     wait_id = State()
+    wait_last_name = State()
 
 class AdminRemove(StatesGroup):
     wait_id = State()
@@ -1441,13 +1476,64 @@ async def admin_add_wait(message: types.Message, state: FSMContext):
             await state.clear()
             return await message.answer("⚠️ Цей користувач вже є адміністратором.")
 
-        session.add(Admin(telegram_id=tg_id, is_superadmin=False))
+    await state.update_data(new_admin_id=tg_id)
+    await state.set_state(AdminAdd.wait_last_name)
+    await message.answer(
+        "✏️ Введіть прізвище адміністратора:",
+        reply_markup=navigation_keyboard(),
+    )
+
+
+@dp.message(AdminAdd.wait_last_name)
+async def admin_add_wait_last_name(message: types.Message, state: FSMContext):
+    if not await is_super_admin_user(message.from_user.id):
+        await state.clear()
+        return await message.answer(
+            "⛔ Тільки суперадмін може керувати адміністраторами.",
+            reply_markup=navigation_keyboard(include_back=False),
+        )
+
+    if message.text == BACK_TEXT:
+        await state.set_state(AdminAdd.wait_id)
+        return await message.answer(
+            "➕ Введіть Telegram ID користувача:",
+            reply_markup=navigation_keyboard(),
+        )
+
+    last_name = message.text.strip()
+    if not last_name:
+        return await message.answer("❌ Прізвище не може бути порожнім.")
+
+    data = await state.get_data()
+    tg_id = data.get("new_admin_id")
+
+    if not tg_id:
+        await state.clear()
+        return await message.answer(
+            "Сталася помилка. Спробуйте додати адміністратора ще раз.",
+            reply_markup=navigation_keyboard(include_back=False),
+        )
+
+    async with SessionLocal() as session:
+        exists = await session.execute(select(Admin).where(Admin.telegram_id == tg_id))
+        if exists.scalar_one_or_none():
+            await state.clear()
+            return await message.answer("⚠️ Цей користувач вже є адміністратором.")
+
+        admin_last_name = "Админ" if tg_id == SUPERADMIN_ID else last_name
+        session.add(
+            Admin(
+                telegram_id=tg_id,
+                last_name=admin_last_name,
+                is_superadmin=tg_id == SUPERADMIN_ID,
+            )
+        )
         await session.commit()
 
     await state.clear()
     await message.answer(
-        f"✔ Користувач <code>{tg_id}</code> доданий як адміністратор.",
-        reply_markup=navigation_keyboard(include_back=False)
+        f"✔ Адміністратор <b>{admin_last_name}</b> доданий.",
+        reply_markup=navigation_keyboard(include_back=False),
     )
 
 
@@ -1490,12 +1576,33 @@ async def admin_remove_wait(message: types.Message, state: FSMContext):
         return await message.answer("❌ ID має бути числовим.")
 
     async with SessionLocal() as session:
-        await session.execute(delete(Admin).where(Admin.telegram_id == tg_id))
+        admin = (
+            await session.execute(
+                select(Admin).where(Admin.telegram_id == tg_id)
+            )
+        ).scalar_one_or_none()
+
+        if not admin:
+            await state.clear()
+            return await message.answer(
+                "Адміністратор з таким ID не знайдений.",
+                reply_markup=navigation_keyboard(include_back=False),
+            )
+
+        if admin.is_superadmin:
+            await state.clear()
+            return await message.answer(
+                "Суперадміністратора не можна видалити.",
+                reply_markup=navigation_keyboard(include_back=False),
+            )
+
+        admin_name = "Админ" if admin.telegram_id == SUPERADMIN_ID else (admin.last_name or str(admin.telegram_id))
+        await session.delete(admin)
         await session.commit()
 
     await state.clear()
     await message.answer(
-        f"🗑 Адміністратора <code>{tg_id}</code> видалено.",
+        f"🗑 Адміністратора <b>{admin_name}</b> видалено.",
         reply_markup=navigation_keyboard(include_back=False)
     )
 
@@ -2411,7 +2518,13 @@ async def main():
             select(Admin).where(Admin.telegram_id == SUPERADMIN_ID)
         )
         if not res.scalar_one_or_none():
-            session.add(Admin(telegram_id=SUPERADMIN_ID, is_superadmin=True))
+            session.add(
+                Admin(
+                    telegram_id=SUPERADMIN_ID,
+                    is_superadmin=True,
+                    last_name="Админ",
+                )
+            )
             await session.commit()
 
     asyncio.create_task(auto_close_overdue_requests())
