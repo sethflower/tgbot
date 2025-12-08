@@ -10,6 +10,7 @@ import asyncio
 import logging
 from datetime import datetime, date, timedelta, time as dtime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
@@ -23,7 +24,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     InlineKeyboardButton,
-    InputMediaPhoto,
 )
 
 from sqlalchemy.ext.asyncio import (
@@ -48,6 +48,11 @@ from dotenv import load_dotenv
 ###############################################################
 
 load_dotenv()
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+def kyiv_now() -> datetime:
+    return datetime.now(KYIV_TZ)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPERADMIN_ID = int(os.getenv("SUPERADMIN_ID"))
@@ -113,8 +118,8 @@ class Request(Base):
     date = Column(Date)
     time = Column(Text)
 
-    created_at = Column(TIMESTAMP, default=datetime.utcnow)
-    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(TIMESTAMP, default=kyiv_now)
+    updated_at = Column(TIMESTAMP, default=kyiv_now, onupdate=kyiv_now)
     status = Column(String, default="new")
     admin_id = Column(BigInteger, nullable=True)
     sheet_row = Column(Integer, nullable=True)
@@ -203,7 +208,6 @@ class GoogleSheetClient:
         return self._worksheet is not None
 
     def _build_row(self, req: Request) -> list[str]:
-        docs_present = bool(parse_doc_ids(req.docs_file_id))
         admin_decision = req.status in {"approved", "rejected"}
 
         if req.status == "approved" and req.date and req.time:
@@ -218,11 +222,8 @@ class GoogleSheetClient:
             req.created_at.strftime("%d.%m.%Y %H:%M") if req.created_at else "",
             req.updated_at.strftime("%d.%m.%Y %H:%M") if admin_decision and req.updated_at else "",
             req.supplier,
-            req.driver_name,
-            req.car,
             req.phone,
-            "Да" if docs_present else "Нет",
-            req.cargo_type or "",
+            req.car,
             req.loading_type,
             req.planned_date.strftime("%d.%m.%Y") if req.planned_date else "",
             req.planned_time or "",
@@ -239,7 +240,7 @@ class GoogleSheetClient:
         try:
             await asyncio.to_thread(
                 self._worksheet.update,
-                f"A{row_number}:R{row_number}",
+                f"A{row_number}:O{row_number}",
                 [values],
                 value_input_option="USER_ENTERED",
             )
@@ -313,7 +314,7 @@ class GoogleSheetClient:
             return
 
         try:
-            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:R"])
+            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:O"])
         except Exception as exc:
             logging.exception("Не вдалося очистити таблицю Sheets: %s", exc)
 
@@ -404,11 +405,8 @@ async def is_super_admin_user(user_id: int) -> bool:
 
 class QueueForm(StatesGroup):
     supplier = State()
-    driver_name = State()
     phone = State()
     car = State()
-    docs = State()
-    cargo_type = State()
     loading_type = State()
     calendar = State()
     hour = State()
@@ -436,11 +434,8 @@ class UserEditForm(StatesGroup):
     user_id = State()
     field_choice = State()
     supplier = State()
-    driver_name = State()
     phone = State()
     car = State()
-    cargo_type = State()
-    docs = State()
     loading_type = State()
     calendar = State()     # выбор даты
     new_date = State()     # подтверждение даты
@@ -551,10 +546,8 @@ def format_request_text(req: Request) -> str:
         f"Статус: {status}\n"
         "━━━━━━━━━━━━━━━━\n"
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
-        f"👤 <b>Водій:</b> {req.driver_name}\n"
         f"📞 <b>Контакт:</b> {req.phone}\n"
         f"🚚 <b>Авто:</b> {req.car}\n"
-        f"📦 <b>Тип вантажу:</b> {req.cargo_type}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>План:</b> {planned_date} {planned_time}\n"
         f"✅ <b>Підтверджено:</b> {req.date.strftime('%d.%m.%Y')} {req.time}\n"
@@ -567,43 +560,7 @@ def build_recent_request_ids(reqs: list[Request]) -> set[int]:
 
 
 def set_updated_now(req: Request):
-    req.updated_at = datetime.utcnow()
-
-
-def parse_doc_ids(raw: str | None) -> list[str]:
-    if not raw:
-        return []
-    try:
-        loaded = json.loads(raw)
-        if isinstance(loaded, list):
-            return [str(item) for item in loaded if str(item)]
-    except Exception:
-        pass
-    return [raw]
-
-
-def serialize_doc_ids(ids: list[str]) -> str | None:
-    clean_ids = [doc_id for doc_id in ids if doc_id]
-    return json.dumps(clean_ids) if clean_ids else None
-
-
-async def send_docs_and_text(
-    target_message: types.Message,
-    doc_ids: list[str],
-    text: str,
-    markup: types.InlineKeyboardMarkup | None = None,
-):
-    if not doc_ids:
-        await target_message.answer(text, reply_markup=markup)
-        return
-
-    if len(doc_ids) == 1:
-        await target_message.answer_photo(doc_ids[0], caption=text, reply_markup=markup)
-        return
-
-    media = [InputMediaPhoto(media=doc_id) for doc_id in doc_ids]
-    await target_message.answer_media_group(media)
-    await target_message.answer(text, reply_markup=markup)
+    req.updated_at = kyiv_now()
 
 
 def get_confirmed_datetime(req: Request) -> datetime | None:
@@ -611,7 +568,7 @@ def get_confirmed_datetime(req: Request) -> datetime | None:
         return None
     try:
         hour, minute = [int(x) for x in req.time.split(":")[:2]]
-        return datetime.combine(req.date, dtime(hour=hour, minute=minute))
+        return datetime.combine(req.date, dtime(hour=hour, minute=minute), tzinfo=KYIV_TZ)
     except Exception:
         return None
 
@@ -643,12 +600,7 @@ async def send_request_details(
         else callback_or_message
     )
 
-    await send_docs_and_text(
-        target_message,
-        parse_doc_ids(req.docs_file_id),
-        text,
-        markup=kb.as_markup(),
-    )
+    await target_message.answer(text, reply_markup=kb.as_markup())
 
     if isinstance(callback_or_message, types.CallbackQuery):
         await callback_or_message.answer()
@@ -723,10 +675,8 @@ async def notify_admins_about_user_deletion(req: Request | dict[str, Any], reaso
         data = {
             "id": req.id,
             "supplier": req.supplier,
-            "driver_name": req.driver_name,
             "phone": req.phone,
             "car": req.car,
-            "cargo_type": req.cargo_type,
             "loading_type": req.loading_type,
             "date": req.date,
             "time": req.time,
@@ -738,10 +688,8 @@ async def notify_admins_about_user_deletion(req: Request | dict[str, Any], reaso
         f"❗ Поставщик {data['supplier']} видалив заявку #{data['id']}\n"
         f"Причина: {reason}\n\n"
         f"📄 Дані заявки до видалення:\n"
-        f"👤 {data['driver_name']}\n"
         f"📞 {data['phone']}\n"
         f"🚚 {data['car']}\n"
-        f"📦 {data['cargo_type']}\n"
         f"🧱 {data['loading_type']}\n"
         f"📅 {data['date'].strftime('%d.%m.%Y')} ⏰ {data['time']}"
     )
@@ -775,10 +723,8 @@ async def my_delete_reason(message: types.Message, state: FSMContext):
         req_data = {
             "id": req.id,
             "supplier": req.supplier,
-            "driver_name": req.driver_name,
             "phone": req.phone,
             "car": req.car,
-            "cargo_type": req.cargo_type,
             "loading_type": req.loading_type,
             "date": req.date,
             "time": req.time,
@@ -831,12 +777,9 @@ async def my_edit(callback: types.CallbackQuery, state: FSMContext):
 def build_user_edit_choice_keyboard():
     kb = InlineKeyboardBuilder()
     kb.button(text="🏢 Постачальник", callback_data="edit_field_supplier")
-    kb.button(text="👤 Водій", callback_data="edit_field_driver")
     kb.button(text="📞 Телефон", callback_data="edit_field_phone")
     kb.button(text="🚚 Авто", callback_data="edit_field_car")
-    kb.button(text="📦 Тип вантажу", callback_data="edit_field_cargo")
     kb.button(text="🧱 Тип завантаження", callback_data="edit_field_loading")
-    kb.button(text="📄 Документи", callback_data="edit_field_docs")
     kb.button(text="📅 Дата та час", callback_data="edit_field_datetime")
     kb.adjust(1)
     return add_inline_navigation(kb, back_callback="edit_cancel").as_markup()
@@ -937,35 +880,6 @@ async def user_edit_supplier(message: types.Message, state: FSMContext):
         changes=[("Постачальник", old_value, req.supplier)],
     )
 
-@dp.message(UserEditForm.driver_name)
-async def user_edit_driver(message: types.Message, state: FSMContext):
-    if message.text == BACK_TEXT:
-        await state.set_state(UserEditForm.field_choice)
-        return await message.answer(
-            "Оберіть, що потрібно змінити у заявці:",
-            reply_markup=build_user_edit_choice_keyboard(),
-        )
-
-    value = message.text.strip()
-    if not value:
-        return await message.answer("Значення не може бути порожнім.")
-
-    req, reason = await _load_request_for_edit(state, message.from_user.id)
-    if not req:
-        return await message.answer("Заявка не знайдена або вам не належить.")
-
-    old_value = req.driver_name
-    req.driver_name = value
-    await finalize_user_edit_update(
-        message,
-        state,
-        req,
-        reason or "",
-        text=f"Поле 'Водій' оновлено для заявки #{req.id}.",
-        changes=[("Водій", old_value, req.driver_name)],
-    )
-
-
 @dp.message(UserEditForm.phone)
 async def user_edit_phone(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
@@ -1024,74 +938,6 @@ async def user_edit_car(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message(UserEditForm.cargo_type)
-async def user_edit_cargo(message: types.Message, state: FSMContext):
-    if message.text == BACK_TEXT:
-        await state.set_state(UserEditForm.field_choice)
-        return await message.answer(
-            "Оберіть, що потрібно змінити у заявці:",
-            reply_markup=build_user_edit_choice_keyboard(),
-        )
-
-    value = message.text.strip()
-    if not value:
-        return await message.answer("Вкажіть тип вантажу.")
-
-    req, reason = await _load_request_for_edit(state, message.from_user.id)
-    if not req:
-        return await message.answer("Заявка не знайдена або вам не належить.")
-
-    old_value = req.cargo_type
-    req.cargo_type = value
-    await finalize_user_edit_update(
-        message,
-        state,
-        req,
-        reason or "",
-        text=f"Поле 'Тип вантажу' оновлено для заявки #{req.id}.",
-        changes=[("Тип вантажу", old_value, req.cargo_type)],
-    )
-
-
-@dp.message(UserEditForm.docs, F.text == BACK_TEXT)
-async def user_edit_docs_back(message: types.Message, state: FSMContext):
-    await state.set_state(UserEditForm.field_choice)
-    await message.answer(
-        "Оберіть, що потрібно змінити у заявці:",
-        reply_markup=build_user_edit_choice_keyboard(),
-    )
-
-
-@dp.message(UserEditForm.docs)
-async def user_edit_docs(message: types.Message, state: FSMContext):
-    req, reason = await _load_request_for_edit(state, message.from_user.id)
-    if not req:
-        return await message.answer("Заявка не знайдена або вам не належить.")
-
-    current_docs = parse_doc_ids(req.docs_file_id)
-    old_value = "Додані" if current_docs else "Відсутні"
-    if message.photo:
-        current_docs.append(message.photo[-1].file_id)
-        req.docs_file_id = serialize_doc_ids(current_docs)
-        status_text = "Фото документів оновлено"
-    elif message.text and message.text.lower().strip() == "без документів":
-        req.docs_file_id = None
-        status_text = "Файли документів видалено"
-    else:
-        return await message.answer(
-            "Надішліть фото або напишіть 'Без документів', щоб прибрати файл."
-        )
-
-    await finalize_user_edit_update(
-        message,
-        state,
-        req,
-        reason or "",
-        text=f"{status_text} для заявки #{req.id}.",
-        changes=[("Документи", old_value, "Додані" if parse_doc_ids(req.docs_file_id) else "Відсутні")],
-    )
-
-
 @dp.callback_query(UserEditForm.loading_type, F.data == "edit_back_to_choice")
 async def user_edit_loading_back(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(UserEditForm.field_choice)
@@ -1141,10 +987,8 @@ async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContex
 
     prompts = {
         "supplier": (UserEditForm.supplier, "Введіть нову назву постачальника:"),
-        "driver": (UserEditForm.driver_name, "Введіть нове ім'я водія:"),
         "phone": (UserEditForm.phone, "Введіть новий номер телефону:"),
         "car": (UserEditForm.car, "Введіть нову марку і номер авто:"),
-        "cargo": (UserEditForm.cargo_type, "Вкажіть новий тип вантажу:"),
     }
 
     if choice in prompts:
@@ -1161,12 +1005,6 @@ async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContex
         await callback.message.answer(
             "Оберіть новий тип завантаження:",
             reply_markup=add_inline_navigation(kb, back_callback="edit_back_to_choice").as_markup(),
-        )
-    elif choice == "docs":
-        await state.set_state(UserEditForm.docs)
-        await callback.message.answer(
-            "Надішліть нове фото документів або напишіть 'Без документів' щоб прибрати файл.",
-            reply_markup=navigation_keyboard(),
         )
     elif choice == "datetime":
         await state.set_state(UserEditForm.calendar)
@@ -1420,10 +1258,8 @@ def build_admin_request_view(req: Request, is_superadmin: bool):
         f"<b>📄 Заявка #{req.id}</b>\n"
         f"Статус: {status}\n\n"
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
-        f"👤 <b>Водій:</b> {req.driver_name}\n"
         f"📞 <b>Телефон:</b> {req.phone}\n"
         f"🚚 <b>Авто:</b> {req.car}\n"
-        f"📦 <b>Тип вантажу:</b> {req.cargo_type}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>План:</b> {plan_date} {plan_time}\n"
         f"✅ <b>Підтверджено:</b> {req.date.strftime('%d.%m.%Y')} {req.time}\n"
@@ -1466,12 +1302,7 @@ async def admin_view(callback: types.CallbackQuery):
 
     text, markup = build_admin_request_view(req, is_superadmin)
 
-    await send_docs_and_text(
-        callback.message,
-        parse_doc_ids(req.docs_file_id),
-        text,
-        markup=markup,
-    )
+    await callback.message.answer(text, reply_markup=markup)
 
     await callback.answer()
 
@@ -1518,12 +1349,7 @@ async def admin_search_wait(message: types.Message, state: FSMContext):
 
     text, markup = build_admin_request_view(req, is_superadmin)
 
-    await send_docs_and_text(
-        message,
-        parse_doc_ids(req.docs_file_id),
-        text,
-        markup=markup,
-    )
+    await message.answer(text, reply_markup=markup)
 
     await state.clear()
 ###############################################################
@@ -1681,7 +1507,7 @@ async def step_supplier(message: types.Message, state: FSMContext):
         return await message.answer(
             "ℹ️ Ви на початку анкети. Використовуйте кнопки навігації."
         )
-        
+
     supplier = message.text.strip()
 
     if not supplier:
@@ -1690,29 +1516,7 @@ async def step_supplier(message: types.Message, state: FSMContext):
     await state.update_data(supplier=supplier)
 
     await message.answer(
-        "👤 <b>Крок 2/8</b>\nВведіть ПІБ водія:",
-        reply_markup=navigation_keyboard()
-    )
-    await state.set_state(QueueForm.driver_name)
-
-
-@dp.message(QueueForm.driver_name)
-async def step_driver_name(message: types.Message, state: FSMContext):
-    if message.text == BACK_TEXT:
-        await state.set_state(QueueForm.supplier)
-        return await message.answer(
-            "🏢 <b>Крок 1/8</b>\nВкажіть назву постачальника:",
-            reply_markup=navigation_keyboard(include_back=False)
-        )
-
-    name = message.text.strip()
-    if not name:
-        return await message.answer("⚠️ Потрібно вказати ПІБ водія.")
-
-    await state.update_data(driver_name=name)
-
-    await message.answer(
-        "📞 <b>Крок 3/8</b>\nЗалиште контактний номер телефону:",
+        "📞 <b>Крок 2/5</b>\nЗалиште контактний номер телефону:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.phone)
@@ -1721,10 +1525,10 @@ async def step_driver_name(message: types.Message, state: FSMContext):
 @dp.message(QueueForm.phone)
 async def step_phone(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
-        await state.set_state(QueueForm.driver_name)
+        await state.set_state(QueueForm.supplier)
         return await message.answer(
-            "👤 <b>Крок 2/8</b>\nВведіть ПІБ водія:",
-            reply_markup=navigation_keyboard()
+            "🏢 <b>Крок 1/5</b>\nВкажіть назву постачальника:",
+            reply_markup=navigation_keyboard(include_back=False)
         )
 
     phone = message.text.strip()
@@ -1734,7 +1538,7 @@ async def step_phone(message: types.Message, state: FSMContext):
     await state.update_data(phone=phone)
 
     await message.answer(
-        "🚚 <b>Крок 4/8</b>\nВведіть марку та номер авто:",
+        "🚚 <b>Крок 3/5</b>\nВведіть марку та номер авто:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.car)
@@ -1745,8 +1549,8 @@ async def step_car(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.phone)
         return await message.answer(
-            "📞 <b>Крок 3/8</b>\nЗалиште контактний номер телефону:",
-            reply_markup=navigation_keyboard()
+            "📞 <b>Крок 2/5</b>\nЗалиште контактний номер телефону:",
+            reply_markup=navigation_keyboard(),
         )
 
     car = message.text.strip()
@@ -1756,116 +1560,26 @@ async def step_car(message: types.Message, state: FSMContext):
     await state.update_data(car=car)
 
     kb = InlineKeyboardBuilder()
-    kb.button(text="📸 Завантажити фото документів", callback_data="photo_upload")
-    kb.button(text="⏭ Пропустити", callback_data="photo_skip")
-    kb.adjust(1)
-
-    await message.answer(
-        "📎 <b>Крок 5/8</b>\nДодайте фото документів або пропустіть:",
-        reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
-    )
-
-    await state.set_state(QueueForm.docs)
-###############################################################
-#                DOCUMENT UPLOAD (Aiogram 3 OK)               
-###############################################################
-
-@dp.callback_query(QueueForm.docs, F.data == "photo_upload")
-async def photo_upload(callback: types.CallbackQuery):
-    await callback.message.answer(
-        "📸 Надішліть якісне фото документів (можна кілька)."
-    )
-
-@dp.callback_query(QueueForm.docs, F.data == "back_to_car")
-async def back_to_car(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(QueueForm.car)
-    await callback.message.answer(
-        "🚚 Введіть марку і номер авто:",
-        reply_markup=navigation_keyboard()
-    )
-    await callback.answer()
-
-
-@dp.message(QueueForm.docs, F.text == BACK_TEXT)
-async def docs_back(message: types.Message, state: FSMContext):
-    await state.set_state(QueueForm.car)
-    await message.answer(
-        "🚚 <b>Крок 4/8</b>\nВведіть марку та номер авто:",
-        reply_markup=navigation_keyboard()
-    )
-
-
-
-@dp.message(QueueForm.docs, F.photo)
-async def photo_received(message: types.Message, state: FSMContext):
-    file_id = message.photo[-1].file_id
-    data = await state.get_data()
-    docs = data.get("docs_file_ids", [])
-    docs.append(file_id)
-    await state.update_data(docs_file_ids=docs)
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="⏭ Далі", callback_data="photo_done")
-    kb.adjust(1)
-
-    await message.answer(
-        "✅ Фото додано. Можете надіслати ще або натиснути 'Далі'.",
-        reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
-    )
-
-
-@dp.callback_query(QueueForm.docs, F.data == "photo_skip")
-@dp.callback_query(QueueForm.docs, F.data == "photo_done")
-async def photo_done(callback: types.CallbackQuery, state: FSMContext):
-
-    await callback.message.answer(
-        "📦 <b>Крок 6/8</b>\nВкажіть тип вантажу:",
-        reply_markup=navigation_keyboard()
-    )
-
-    await state.set_state(QueueForm.cargo_type)
-
-
-@dp.message(QueueForm.cargo_type)
-async def step_cargo_type(message: types.Message, state: FSMContext):
-    if message.text == BACK_TEXT:
-        kb = InlineKeyboardBuilder()
-        kb.button(text="📸 Завантажити фото документів", callback_data="photo_upload")
-        kb.button(text="⏭ Пропустити", callback_data="photo_skip")
-        kb.adjust(1)
-        await state.set_state(QueueForm.docs)
-        return await message.answer(
-            "📎 <b>Крок 5/8</b>\nДодайте фото документів або пропустіть:",
-            reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup(),
-        )
-
-    cargo = message.text.strip()
-    if not cargo:
-        return await message.answer("Вкажіть тип вантажу, щоб продовжити.")
-
-    await state.update_data(cargo_type=cargo)
-
-    kb = InlineKeyboardBuilder()
     kb.button(text="🚚 На палетах", callback_data="type_pal")
     kb.button(text="📦 В розсип", callback_data="type_loose")
     kb.adjust(1)
 
     await message.answer(
-        "⚙️ <b>Крок 7/8</b>\nОберіть тип завантаження:",
-        reply_markup=add_inline_navigation(kb, back_callback="back_to_cargo").as_markup(),
+        "⚙️ <b>Крок 4/5</b>\nОберіть тип завантаження:",
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup(),
     )
 
     await state.set_state(QueueForm.loading_type)
 
-@dp.callback_query(QueueForm.loading_type, F.data == "back_to_cargo")
+
+@dp.callback_query(QueueForm.loading_type, F.data == "back_to_car")
 async def loading_back(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(QueueForm.cargo_type)
+    await state.set_state(QueueForm.car)
     await callback.message.answer(
-        "📦 <b>Крок 6/8</b>\nВкажіть тип вантажу:",
+        "🚚 <b>Крок 3/5</b>\nВведіть марку та номер авто:",
         reply_markup=navigation_keyboard(),
     )
     await callback.answer()
-
 
 ###############################################################
 #                 LOADING TYPE → DATE
@@ -1883,7 +1597,7 @@ async def step_loading(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(loading_type=t)
 
     await callback.message.answer(
-        "📅 <b>Крок 8/8</b>\nОберіть дату та час візиту:",
+        "📅 <b>Крок 5/5</b>\nОберіть дату та час візиту:",
         reply_markup=build_date_calendar(back_callback="back_to_loading")
     )
 
@@ -1895,9 +1609,15 @@ async def step_loading(callback: types.CallbackQuery, state: FSMContext):
 ###############################################################
 
 def build_date_calendar(year=None, month=None, back_callback: str | None = None):
-    now = datetime.now()
-    year = year or now.year
-    month = month or now.month
+    now = kyiv_now()
+    today = now.date()
+    year = year or today.year
+    month = month or today.month
+
+    current_month_start = date(today.year, today.month, 1)
+    requested_month_start = date(year, month, 1)
+    if requested_month_start < current_month_start:
+        year, month = current_month_start.year, current_month_start.month
 
     kb = InlineKeyboardBuilder()
 
@@ -1912,7 +1632,7 @@ def build_date_calendar(year=None, month=None, back_callback: str | None = None)
     ])
 
     # День недели, с которого начинается месяц
-    first_wday = datetime(year, month, 1).weekday()  # Monday = 0
+    first_wday = datetime(year, month, 1, tzinfo=KYIV_TZ).weekday()  # Monday = 0
 
     row = []
     for _ in range(first_wday):
@@ -1923,13 +1643,17 @@ def build_date_calendar(year=None, month=None, back_callback: str | None = None)
     # Количество дней
     next_month = month + 1 if month < 12 else 1
     next_year = year + 1 if month == 12 else year
-    days_in_month = (datetime(next_year, next_month, 1) - timedelta(days=1)).day
+    days_in_month = (datetime(next_year, next_month, 1, tzinfo=KYIV_TZ) - timedelta(days=1)).day
 
     row = []
     for d in range(1, days_in_month + 1):
-        row.append(
-            InlineKeyboardButton(text=str(d), callback_data=f"day_{year}_{month}_{d}")
-        )
+        day_date = date(year, month, d)
+        if day_date < today:
+            row.append(InlineKeyboardButton(text=str(d), callback_data="ignore"))
+        else:
+            row.append(
+                InlineKeyboardButton(text=str(d), callback_data=f"day_{year}_{month}_{d}")
+            )
         if len(row) == 7:
             kb.row(*row)
             row = []
@@ -1943,8 +1667,11 @@ def build_date_calendar(year=None, month=None, back_callback: str | None = None)
     next_m = next_month
     next_y = next_year
 
+    prev_month_last_day = date(prev_y, prev_m, (datetime(year, month, 1, tzinfo=KYIV_TZ) - timedelta(days=1)).day)
+    prev_cb = f"prev_{prev_y}_{prev_m}" if prev_month_last_day >= today else "ignore"
+
     kb.row(
-        InlineKeyboardButton(text="⬅", callback_data=f"prev_{prev_y}_{prev_m}"),
+        InlineKeyboardButton(text="⬅", callback_data=prev_cb),
         InlineKeyboardButton(text="Закрити", callback_data="close_calendar"),
         InlineKeyboardButton(text="➡", callback_data=f"next_{next_y}_{next_m}")
     )
@@ -1995,10 +1722,13 @@ async def cal_day(callback: types.CallbackQuery, state: FSMContext):
     _, y, m, d = callback.data.split("_")
     chosen = date(int(y), int(m), int(d))
 
+    if chosen < kyiv_now().date():
+        return await callback.answer("Не можна обирати минулі дати", show_alert=True)
+
     await state.update_data(date=chosen)
 
     kb = InlineKeyboardBuilder()
-    for hour in range(24):
+    for hour in range(9, 17):
         kb.button(text=f"{hour:02d}", callback_data=f"hour_{hour:02d}")
     kb.adjust(6)
 
@@ -2030,7 +1760,7 @@ async def back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
 
     await state.set_state(QueueForm.calendar)
     await callback.message.answer(
-        "📅 <b>Крок 8/8</b>\nОберіть дату та час візиту:", reply_markup=markup
+        "📅 <b>Крок 5/5</b>\nОберіть дату та час візиту:", reply_markup=markup
     )
     await callback.answer()
 
@@ -2041,7 +1771,8 @@ async def hour_selected(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(hour=hour)
 
     kb = InlineKeyboardBuilder()
-    for m in range(0, 60, 5):
+    minutes = [0] if hour == "16" else list(range(0, 60, 5))
+    for m in minutes:
         kb.button(text=f"{m:02d}", callback_data=f"min_{m:02d}")
     kb.adjust(6)
 
@@ -2058,23 +1789,33 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
     minute = callback.data.replace("min_", "")
     data = await state.get_data()
 
+    chosen_date: date | None = data.get("date")
+    chosen_hour = data.get("hour")
+
+    if not chosen_date or chosen_date < kyiv_now().date():
+        return await callback.answer("Оберіть доступну дату", show_alert=True)
+
+    if chosen_hour is None:
+        return await callback.answer("Спочатку оберіть годину", show_alert=True)
+
+    selected_time = dtime(hour=int(chosen_hour), minute=int(minute))
+    if not (dtime(hour=9) <= selected_time <= dtime(hour=16)):
+        return await callback.answer("Доступний час з 09:00 до 16:00", show_alert=True)
+
     async with SessionLocal() as session:
         req = Request(
             user_id=callback.from_user.id,
             supplier=data["supplier"],
-            driver_name=data["driver_name"],
             phone=data["phone"],
             car=data["car"],
-            docs_file_id=serialize_doc_ids(data.get("docs_file_ids", [])),
-            cargo_type=data.get("cargo_type"),
             loading_type=data["loading_type"],
-            planned_date=data["date"],
-            planned_time=f"{data['hour']}:{minute}",
-            date=data["date"],
-            time=f"{data['hour']}:{minute}",
+            planned_date=chosen_date,
+            planned_time=f"{int(chosen_hour):02d}:{int(minute):02d}",
+            date=chosen_date,
+            time=f"{int(chosen_hour):02d}:{int(minute):02d}",
             status="new",
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
+            created_at=kyiv_now(),
+            updated_at=kyiv_now(),
         )
 
         session.add(req)
@@ -2123,10 +1864,8 @@ async def broadcast_new_request(req_id: int):
         f"<b>🆕 Нова заявка #{req.id}</b>\n"
         "━━━━━━━━━━━━━━━━\n"
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
-        f"👤 <b>Водій:</b> {req.driver_name}\n"
         f"📞 <b>Контакт:</b> {req.phone}\n"
         f"🚚 <b>Авто:</b> {req.car}\n"
-        f"📦 <b>Тип вантажу:</b> {req.cargo_type}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>План:</b> {req.planned_date.strftime('%d.%m.%Y')}\n"
         f"⏰ <b>Час:</b> {req.planned_time}\n"
@@ -2141,13 +1880,6 @@ async def broadcast_new_request(req_id: int):
 
         try:
             await bot.send_message(admin.telegram_id, text, reply_markup=kb.as_markup())
-            doc_ids = parse_doc_ids(req.docs_file_id)
-            if doc_ids:
-                if len(doc_ids) == 1:
-                    await bot.send_photo(admin.telegram_id, doc_ids[0])
-                else:
-                    media = [InputMediaPhoto(media=doc_id) for doc_id in doc_ids]
-                    await bot.send_media_group(admin.telegram_id, media)
         except:
             pass
 ###############################################################
@@ -2314,7 +2046,7 @@ async def adm_cal_day(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(new_date=chosen_date)
 
     kb = InlineKeyboardBuilder()
-    for h in range(24):
+    for h in range(9, 17):
         kb.button(text=f"{h:02d}", callback_data=f"ach_hour_{h:02d}")
     kb.adjust(6)
 
@@ -2331,7 +2063,8 @@ async def adm_hour(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(new_hour=hour)
 
     kb = InlineKeyboardBuilder()
-    for m in range(0, 60, 5):
+    minutes = [0] if hour == "16" else list(range(0, 60, 5))
+    for m in minutes:
         kb.button(text=f"{m:02d}", callback_data=f"ach_min_{m:02d}")
     kb.adjust(6)
 
@@ -2363,7 +2096,7 @@ async def admin_back_to_calendar(callback: types.CallbackQuery, state: FSMContex
 @dp.callback_query(AdminChangeForm.minute, F.data == "admin_back_to_hour")
 async def admin_back_to_hour(callback: types.CallbackQuery, state: FSMContext):
     kb = InlineKeyboardBuilder()
-    for h in range(24):
+    for h in range(9, 17):
         kb.button(text=f"{h:02d}", callback_data=f"ach_hour_{h:02d}")
     kb.adjust(6)
 
@@ -2384,7 +2117,14 @@ async def adm_min(callback: types.CallbackQuery, state: FSMContext):
     req_id = data["req_id"]
 
     new_date = data["new_date"]
-    new_time = f"{data['new_hour']}:{minute}"
+    new_time = f"{int(data['new_hour']):02d}:{int(minute):02d}"
+
+    if new_date < kyiv_now().date():
+        return await callback.answer("Дата не може бути в минулому", show_alert=True)
+
+    chosen_time = dtime(hour=int(data["new_hour"]), minute=int(minute))
+    if not (dtime(hour=9) <= chosen_time <= dtime(hour=16)):
+        return await callback.answer("Доступний час з 09:00 до 16:00", show_alert=True)
 
     async with SessionLocal() as session:
         req = await session.get(Request, req_id)
@@ -2424,10 +2164,8 @@ async def notify_admins_about_action(req: Request, action: str):
     text = (
         f"ℹ️ <b>Заявка #{req.id} {action}</b>\n\n"
         f"📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}\n"
-        f"👤 {req.driver_name}\n"
         f"🏢 {req.supplier}\n"
         f"🚚 {req.car}\n"
-        f"📦 {req.cargo_type}\n"
         f"🧱 {req.loading_type}\n"
         f"🏁 {final_status}"
     )
@@ -2453,7 +2191,8 @@ async def notify_admins_about_user_edit(
         f"Причина: {reason}\n\n"
         f"Потрібно повторно підтвердити/відхилити або скоригувати дату чи час.\n"
         f"📅 {req.date.strftime('%d.%m.%Y')} ⏰ {req.time}\n"
-        f"👤 {req.driver_name} — {req.phone}\n\n"
+        f"📞 {req.phone}\n"
+        f"🚚 {req.car}\n\n"
         f"Що змінено:\n{changes_text}"
     )
 
@@ -2479,7 +2218,7 @@ async def complete_request(req_id: int, *, auto: bool = False) -> Request | None
         if not req or req.completed_at or req.status != "approved":
             return None
 
-        req.completed_at = datetime.utcnow()
+        req.completed_at = kyiv_now()
         set_updated_now(req)
         await session.commit()
         await session.refresh(req)
@@ -2507,7 +2246,7 @@ async def auto_close_overdue_requests():
 
 
 async def _auto_close_tick():
-    now = datetime.utcnow()
+    now = kyiv_now()
     async with SessionLocal() as session:
         res = await session.execute(
             select(Request).where(
