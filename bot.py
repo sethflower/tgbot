@@ -54,6 +54,10 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 def kyiv_now() -> datetime:
     return datetime.now(KYIV_TZ)
 
+def kyiv_now_naive() -> datetime:
+    return kyiv_now().replace(tzinfo=None)
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPERADMIN_ID = int(os.getenv("SUPERADMIN_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -118,8 +122,8 @@ class Request(Base):
     date = Column(Date)
     time = Column(Text)
 
-    created_at = Column(TIMESTAMP, default=kyiv_now)
-    updated_at = Column(TIMESTAMP, default=kyiv_now, onupdate=kyiv_now)
+    created_at = Column(TIMESTAMP, default=kyiv_now_naive)
+    updated_at = Column(TIMESTAMP, default=kyiv_now_naive, onupdate=kyiv_now_naive)
     status = Column(String, default="new")
     admin_id = Column(BigInteger, nullable=True)
     sheet_row = Column(Integer, nullable=True)
@@ -560,7 +564,7 @@ def build_recent_request_ids(reqs: list[Request]) -> set[int]:
 
 
 def set_updated_now(req: Request):
-    req.updated_at = kyiv_now()
+    req.updated_at = kyiv_now_naive()
 
 
 def get_confirmed_datetime(req: Request) -> datetime | None:
@@ -1814,8 +1818,8 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
             date=chosen_date,
             time=f"{int(chosen_hour):02d}:{int(minute):02d}",
             status="new",
-            created_at=kyiv_now(),
-            updated_at=kyiv_now(),
+            created_at=kyiv_now_naive(),
+            updated_at=kyiv_now_naive(),
         )
 
         session.add(req)
@@ -2218,7 +2222,7 @@ async def complete_request(req_id: int, *, auto: bool = False) -> Request | None
         if not req or req.completed_at or req.status != "approved":
             return None
 
-        req.completed_at = kyiv_now()
+        req.completed_at = kyiv_now_naive()
         set_updated_now(req)
         await session.commit()
         await session.refresh(req)
