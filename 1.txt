@@ -5,9 +5,10 @@
 ###############################################################
 
 import os
+import json
 import asyncio
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dtime
 from typing import Any
 
 from aiogram import Bot, Dispatcher, types, F
@@ -22,6 +23,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     InlineKeyboardButton,
+    InputMediaPhoto,
 )
 
 from sqlalchemy.ext.asyncio import (
@@ -32,8 +34,11 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import declarative_base
 from sqlalchemy import (
     Column, Integer, BigInteger, String, Boolean,
-    Date, Text, TIMESTAMP, select, delete
+    Date, Text, TIMESTAMP, select, delete, text, inspect
 )
+
+import gspread
+from google.oauth2.service_account import Credentials
 
 from dotenv import load_dotenv
 
@@ -47,6 +52,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPERADMIN_ID = int(os.getenv("SUPERADMIN_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
 
 if not all([BOT_TOKEN, SUPERADMIN_ID, DATABASE_URL]):
     raise RuntimeError("❌ ENV-переменные BOT_TOKEN / SUPERADMIN_ID / DATABASE_URL не установлены!")
@@ -97,14 +104,21 @@ class Request(Base):
     car = Column(Text)
 
     docs_file_id = Column(Text, nullable=True)
+    cargo_type = Column(Text)
     loading_type = Column(Text)
+
+    planned_date = Column(Date)
+    planned_time = Column(Text)
 
     date = Column(Date)
     time = Column(Text)
 
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
+    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
     status = Column(String, default="new")
     admin_id = Column(BigInteger, nullable=True)
+    sheet_row = Column(Integer, nullable=True)
+    completed_at = Column(TIMESTAMP, nullable=True)
 
 
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -115,9 +129,200 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+        def ensure_sheet_row_column(sync_conn):
+            inspector = inspect(sync_conn)
+            cols = {c["name"] for c in inspector.get_columns("requests")}
+            if "sheet_row" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN sheet_row INTEGER"))
+            if "cargo_type" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN cargo_type TEXT"))
+            if "planned_date" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN planned_date DATE"))
+            if "planned_time" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN planned_time TEXT"))
+            if "updated_at" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN updated_at TIMESTAMP"))
+            if "completed_at" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN completed_at TIMESTAMP"))
+
+            # backfill plan and timestamps for existing rows
+            sync_conn.execute(text("UPDATE requests SET planned_date = date WHERE planned_date IS NULL"))
+            sync_conn.execute(text("UPDATE requests SET planned_time = time WHERE planned_time IS NULL"))
+            sync_conn.execute(text("UPDATE requests SET updated_at = created_at WHERE updated_at IS NULL"))
+
+        await conn.run_sync(ensure_sheet_row_column)
+
 
 ###############################################################
-#                     CONSTANTS & MENUS                       
+#                        GOOGLE SHEETS
+###############################################################
+
+
+def get_sheet_status(status: str) -> str:
+    return {
+        "new": "Новая",
+        "approved": "Принятая",
+        "rejected": "Отклонённая",
+        "deleted_by_user": "Удалена",
+    }.get(status, status)
+
+
+class GoogleSheetClient:
+    def __init__(self):
+        self._worksheet = None
+        self._init_attempted = False
+
+    async def _ensure_client(self) -> bool:
+        if self._worksheet:
+            return True
+        if self._init_attempted:
+            return False
+
+        self._init_attempted = True
+
+        if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SPREADSHEET_ID:
+            logging.warning("Google Sheets не налаштовано: немає env GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_SPREADSHEET_ID")
+            return False
+
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+
+        try:
+            info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+            creds = Credentials.from_service_account_info(info, scopes=scopes)
+
+            def _init_ws():
+                client = gspread.authorize(creds)
+                return client.open_by_key(GOOGLE_SPREADSHEET_ID).sheet1
+
+            self._worksheet = await asyncio.to_thread(_init_ws)
+            logging.info("Google Sheets клієнт ініціалізовано")
+        except Exception as exc:
+            logging.exception("Не вдалося підключитися до Google Sheets: %s", exc)
+            self._worksheet = None
+
+        return self._worksheet is not None
+
+    def _build_row(self, req: Request) -> list[str]:
+        docs_present = bool(parse_doc_ids(req.docs_file_id))
+        admin_decision = req.status in {"approved", "rejected"}
+
+        if req.status == "approved" and req.date and req.time:
+            confirmed_date = req.date.strftime("%d.%m.%Y")
+            confirmed_time = req.time
+        elif req.status == "rejected":
+            confirmed_date = confirmed_time = "Отклонена"
+        else:
+            confirmed_date = confirmed_time = ""
+
+        return [
+            req.created_at.strftime("%d.%m.%Y %H:%M") if req.created_at else "",
+            req.updated_at.strftime("%d.%m.%Y %H:%M") if admin_decision and req.updated_at else "",
+            req.supplier,
+            req.driver_name,
+            req.car,
+            req.phone,
+            "Да" if docs_present else "Нет",
+            req.cargo_type or "",
+            req.loading_type,
+            req.planned_date.strftime("%d.%m.%Y") if req.planned_date else "",
+            req.planned_time or "",
+            get_sheet_status(req.status),
+            confirmed_date,
+            confirmed_time,
+            "Завершена" if req.completed_at else "Не завершена",
+            str(req.admin_id) if admin_decision and req.admin_id else "",
+            req.completed_at.strftime("%d.%m.%Y %H:%M") if req.completed_at else "",
+            str(req.id),
+        ]
+
+    async def _update_row(self, row_number: int, values: list[str]) -> bool:
+        try:
+            await asyncio.to_thread(
+                self._worksheet.update,
+                f"A{row_number}:R{row_number}",
+                [values],
+                value_input_option="USER_ENTERED",
+            )
+            return True
+        except Exception as exc:
+            logging.exception("Не вдалося оновити рядок %s у Sheets: %s", row_number, exc)
+            return False
+
+    async def _append_row(self, values: list[str]) -> int | None:
+        try:
+            result = await asyncio.to_thread(
+                self._worksheet.append_row,
+                values,
+                value_input_option="USER_ENTERED",
+                table_range="A2",
+            )
+            updated_range = None
+            if isinstance(result, dict):
+                updated_range = result.get("updates", {}).get("updatedRange")
+
+            if updated_range:
+                first_cell = updated_range.split("!")[-1].split(":")[0]
+                row_digits = "".join(ch for ch in first_cell if ch.isdigit())
+                if row_digits.isdigit():
+                    return int(row_digits)
+
+            # fallback: запитати кількість заповнених рядків
+            values_count = await asyncio.to_thread(self._worksheet.get_all_values)
+            return len(values_count)
+        except Exception as exc:
+            logging.exception("Не вдалося додати рядок у Sheets: %s", exc)
+            return None
+
+    async def _store_row_number(self, req_id: int, row_number: int):
+        async with SessionLocal() as session:
+            req = await session.get(Request, req_id)
+            if not req:
+                return
+            req.sheet_row = row_number
+            await session.commit()
+
+    async def sync_request(self, req: Request):
+        if not await self._ensure_client():
+            return
+
+        values = self._build_row(req)
+
+        if req.sheet_row:
+            updated = await self._update_row(req.sheet_row, values)
+            if updated:
+                return
+
+        row_number = await self._append_row(values)
+        if row_number:
+            await self._store_row_number(req.id, row_number)
+
+    async def delete_request(self, req: Request):
+        if not await self._ensure_client():
+            return
+
+        if not req.sheet_row:
+            return
+
+        try:
+            await asyncio.to_thread(self._worksheet.delete_rows, req.sheet_row)
+        except Exception as exc:
+            logging.exception("Не вдалося видалити рядок %s у Sheets: %s", req.sheet_row, exc)
+
+    async def clear_requests(self):
+        if not await self._ensure_client():
+            return
+
+        try:
+            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:R"])
+        except Exception as exc:
+            logging.exception("Не вдалося очистити таблицю Sheets: %s", exc)
+
+
+sheet_client = GoogleSheetClient()
+
+
+###############################################################
+#                     CONSTANTS & MENUS
 ###############################################################
 
 BACK_TEXT = "↩️ Назад"
@@ -173,6 +378,7 @@ def admin_menu():
     kb = InlineKeyboardBuilder()
     kb.button(text="🆕 Нові заявки", callback_data="admin_new")
     kb.button(text="📚 Усі заявки", callback_data="admin_all")
+    kb.button(text="🔎 Пошук за ID", callback_data="admin_search")
     kb.button(text="➕ Додати адміна", callback_data="admin_add")
     kb.button(text="➖ Видалити адміна", callback_data="admin_remove")
     kb.button(text="🗑 Очистити БД", callback_data="admin_clear")
@@ -190,6 +396,7 @@ class QueueForm(StatesGroup):
     phone = State()
     car = State()
     docs = State()
+    cargo_type = State()
     loading_type = State()
     calendar = State()
     hour = State()
@@ -199,6 +406,9 @@ class AdminAdd(StatesGroup):
     wait_id = State()
 
 class AdminRemove(StatesGroup):
+    wait_id = State()
+
+class AdminSearch(StatesGroup):
     wait_id = State()
 
 class AdminChangeForm(StatesGroup):
@@ -217,6 +427,7 @@ class UserEditForm(StatesGroup):
     driver_name = State()
     phone = State()
     car = State()
+    cargo_type = State()
     docs = State()
     loading_type = State()
     calendar = State()     # выбор даты
@@ -320,6 +531,9 @@ def get_status_label(status: str) -> str:
 
 def format_request_text(req: Request) -> str:
     status = get_status_label(req.status)
+    final_status = "Завершена" if req.completed_at else "Не завершена"
+    planned_date = req.planned_date.strftime('%d.%m.%Y') if req.planned_date else req.date.strftime('%d.%m.%Y')
+    planned_time = req.planned_time if req.planned_time else req.time
     return (
         f"<b>📄 Заявка #{req.id}</b>\n"
         f"Статус: {status}\n"
@@ -328,14 +542,66 @@ def format_request_text(req: Request) -> str:
         f"👤 <b>Водій:</b> {req.driver_name}\n"
         f"📞 <b>Контакт:</b> {req.phone}\n"
         f"🚚 <b>Авто:</b> {req.car}\n"
+        f"📦 <b>Тип вантажу:</b> {req.cargo_type}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
-        f"📅 <b>Дата:</b> {req.date.strftime('%d.%m.%Y')}\n"
-        f"⏰ <b>Час:</b> {req.time}"
+        f"📅 <b>План:</b> {planned_date} {planned_time}\n"
+        f"✅ <b>Підтверджено:</b> {req.date.strftime('%d.%m.%Y')} {req.time}\n"
+        f"🏁 <b>Статус завершення:</b> {final_status}"
     )
 
 
 def build_recent_request_ids(reqs: list[Request]) -> set[int]:
     return {req.id for req in reqs}
+
+
+def set_updated_now(req: Request):
+    req.updated_at = datetime.utcnow()
+
+
+def parse_doc_ids(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        loaded = json.loads(raw)
+        if isinstance(loaded, list):
+            return [str(item) for item in loaded if str(item)]
+    except Exception:
+        pass
+    return [raw]
+
+
+def serialize_doc_ids(ids: list[str]) -> str | None:
+    clean_ids = [doc_id for doc_id in ids if doc_id]
+    return json.dumps(clean_ids) if clean_ids else None
+
+
+async def send_docs_and_text(
+    target_message: types.Message,
+    doc_ids: list[str],
+    text: str,
+    markup: types.InlineKeyboardMarkup | None = None,
+):
+    if not doc_ids:
+        await target_message.answer(text, reply_markup=markup)
+        return
+
+    if len(doc_ids) == 1:
+        await target_message.answer_photo(doc_ids[0], caption=text, reply_markup=markup)
+        return
+
+    media = [InputMediaPhoto(media=doc_id) for doc_id in doc_ids]
+    await target_message.answer_media_group(media)
+    await target_message.answer(text, reply_markup=markup)
+
+
+def get_confirmed_datetime(req: Request) -> datetime | None:
+    if not req.date or not req.time:
+        return None
+    try:
+        hour, minute = [int(x) for x in req.time.split(":")[:2]]
+        return datetime.combine(req.date, dtime(hour=hour, minute=minute))
+    except Exception:
+        return None
 
 
 async def send_request_details(
@@ -346,7 +612,12 @@ async def send_request_details(
     recent_ids: set[int] | None = None,
 ):
     kb = InlineKeyboardBuilder()
-    if allow_actions and req.id in (recent_ids or set()) and req.status != "deleted_by_user":
+    if (
+        allow_actions
+        and req.id in (recent_ids or set())
+        and req.status != "deleted_by_user"
+        and not req.completed_at
+    ):
         kb.button(text="✏️ Змінити", callback_data=f"my_edit_{req.id}")
         kb.button(text="🗑 Видалити", callback_data=f"my_delete_{req.id}")
     kb.button(text="⬅️ Мої заявки", callback_data="menu_my")
@@ -360,10 +631,12 @@ async def send_request_details(
         else callback_or_message
     )
 
-    if req.docs_file_id:
-        await target_message.answer_photo(req.docs_file_id, caption=text, reply_markup=kb.as_markup())
-    else:
-        await target_message.answer(text, reply_markup=kb.as_markup())
+    await send_docs_and_text(
+        target_message,
+        parse_doc_ids(req.docs_file_id),
+        text,
+        markup=kb.as_markup(),
+    )
 
     if isinstance(callback_or_message, types.CallbackQuery):
         await callback_or_message.answer()
@@ -419,6 +692,9 @@ async def my_delete(callback: types.CallbackQuery, state: FSMContext):
     if req.status == "deleted_by_user":
         return await callback.answer("Заявка вже видалена", show_alert=True)
 
+    if req.completed_at:
+        return await callback.answer("Заявка вже завершена, зміни неможливі", show_alert=True)
+
     await state.set_state(UserDeleteForm.reason)
     await state.update_data(req_id=req_id)
     await callback.message.answer(
@@ -438,6 +714,7 @@ async def notify_admins_about_user_deletion(req: Request | dict[str, Any], reaso
             "driver_name": req.driver_name,
             "phone": req.phone,
             "car": req.car,
+            "cargo_type": req.cargo_type,
             "loading_type": req.loading_type,
             "date": req.date,
             "time": req.time,
@@ -452,6 +729,7 @@ async def notify_admins_about_user_deletion(req: Request | dict[str, Any], reaso
         f"👤 {data['driver_name']}\n"
         f"📞 {data['phone']}\n"
         f"🚚 {data['car']}\n"
+        f"📦 {data['cargo_type']}\n"
         f"🧱 {data['loading_type']}\n"
         f"📅 {data['date'].strftime('%d.%m.%Y')} ⏰ {data['time']}"
     )
@@ -478,12 +756,17 @@ async def my_delete_reason(message: types.Message, state: FSMContext):
             await state.clear()
             return await message.answer("Заявка не знайдена або вам не належить.")
 
+        if req.completed_at:
+            await state.clear()
+            return await message.answer("Заявка вже завершена, зміни неможливі.")
+
         req_data = {
             "id": req.id,
             "supplier": req.supplier,
             "driver_name": req.driver_name,
             "phone": req.phone,
             "car": req.car,
+            "cargo_type": req.cargo_type,
             "loading_type": req.loading_type,
             "date": req.date,
             "time": req.time,
@@ -491,6 +774,8 @@ async def my_delete_reason(message: types.Message, state: FSMContext):
 
         await session.delete(req)
         await session.commit()
+
+    await sheet_client.delete_request(req)
 
     await notify_admins_about_user_deletion(req_data, reason)
     await message.answer(
@@ -520,6 +805,9 @@ async def my_edit(callback: types.CallbackQuery, state: FSMContext):
     if req.status == "deleted_by_user":
         return await callback.answer("Заявка вже видалена", show_alert=True)
 
+    if req.completed_at:
+        return await callback.answer("Заявка вже завершена, редагування неможливе", show_alert=True)
+
     await state.set_state(UserEditForm.reason)
     await state.update_data(req_id=req_id)
     await callback.message.answer(
@@ -534,6 +822,7 @@ def build_user_edit_choice_keyboard():
     kb.button(text="👤 Водій", callback_data="edit_field_driver")
     kb.button(text="📞 Телефон", callback_data="edit_field_phone")
     kb.button(text="🚚 Авто", callback_data="edit_field_car")
+    kb.button(text="📦 Тип вантажу", callback_data="edit_field_cargo")
     kb.button(text="🧱 Тип завантаження", callback_data="edit_field_loading")
     kb.button(text="📄 Документи", callback_data="edit_field_docs")
     kb.button(text="📅 Дата та час", callback_data="edit_field_datetime")
@@ -555,6 +844,10 @@ async def my_edit_reason(message: types.Message, state: FSMContext):
             await state.clear()
             return await message.answer("Заявка не знайдена або вам не належить.")
 
+        if req.completed_at:
+            await state.clear()
+            return await message.answer("Заявка вже завершена, редагування неможливе.")
+
     await state.update_data(reason=reason)
     await state.set_state(UserEditForm.field_choice)
     await message.answer(
@@ -574,6 +867,7 @@ async def finalize_user_edit_update(
 ):
     req.status = "new"
     req.admin_id = None
+    set_updated_now(req)
 
     async with SessionLocal() as session:
         session.add(req)
@@ -581,6 +875,7 @@ async def finalize_user_edit_update(
 
     target = message_or_callback.message if isinstance(message_or_callback, types.CallbackQuery) else message_or_callback
     await target.answer(text, reply_markup=navigation_keyboard(include_back=False))
+    await sheet_client.sync_request(req)
     await notify_admins_about_user_edit(req, reason, changes)
     await state.clear()
     if isinstance(message_or_callback, types.CallbackQuery):
@@ -595,7 +890,7 @@ async def _load_request_for_edit(state: FSMContext, user_id: int) -> tuple[Reque
     async with SessionLocal() as session:
         req = await session.get(Request, req_id)
 
-    if not req or req.user_id != user_id:
+    if not req or req.user_id != user_id or req.completed_at:
         await state.clear()
         return None, None
 
@@ -717,6 +1012,35 @@ async def user_edit_car(message: types.Message, state: FSMContext):
     )
 
 
+@dp.message(UserEditForm.cargo_type)
+async def user_edit_cargo(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(UserEditForm.field_choice)
+        return await message.answer(
+            "Оберіть, що потрібно змінити у заявці:",
+            reply_markup=build_user_edit_choice_keyboard(),
+        )
+
+    value = message.text.strip()
+    if not value:
+        return await message.answer("Вкажіть тип вантажу.")
+
+    req, reason = await _load_request_for_edit(state, message.from_user.id)
+    if not req:
+        return await message.answer("Заявка не знайдена або вам не належить.")
+
+    old_value = req.cargo_type
+    req.cargo_type = value
+    await finalize_user_edit_update(
+        message,
+        state,
+        req,
+        reason or "",
+        text=f"Поле 'Тип вантажу' оновлено для заявки #{req.id}.",
+        changes=[("Тип вантажу", old_value, req.cargo_type)],
+    )
+
+
 @dp.message(UserEditForm.docs, F.text == BACK_TEXT)
 async def user_edit_docs_back(message: types.Message, state: FSMContext):
     await state.set_state(UserEditForm.field_choice)
@@ -732,9 +1056,11 @@ async def user_edit_docs(message: types.Message, state: FSMContext):
     if not req:
         return await message.answer("Заявка не знайдена або вам не належить.")
 
-    old_value = "Додані" if req.docs_file_id else "Відсутні"
+    current_docs = parse_doc_ids(req.docs_file_id)
+    old_value = "Додані" if current_docs else "Відсутні"
     if message.photo:
-        req.docs_file_id = message.photo[-1].file_id
+        current_docs.append(message.photo[-1].file_id)
+        req.docs_file_id = serialize_doc_ids(current_docs)
         status_text = "Фото документів оновлено"
     elif message.text and message.text.lower().strip() == "без документів":
         req.docs_file_id = None
@@ -750,7 +1076,7 @@ async def user_edit_docs(message: types.Message, state: FSMContext):
         req,
         reason or "",
         text=f"{status_text} для заявки #{req.id}.",
-        changes=[("Документи", old_value, "Додані" if req.docs_file_id else "Відсутні")],
+        changes=[("Документи", old_value, "Додані" if parse_doc_ids(req.docs_file_id) else "Відсутні")],
     )
 
 
@@ -806,6 +1132,7 @@ async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContex
         "driver": (UserEditForm.driver_name, "Введіть нове ім'я водія:"),
         "phone": (UserEditForm.phone, "Введіть новий номер телефону:"),
         "car": (UserEditForm.car, "Введіть нову марку і номер авто:"),
+        "cargo": (UserEditForm.cargo_type, "Вкажіть новий тип вантажу:"),
     }
 
     if choice in prompts:
@@ -960,6 +1287,8 @@ async def user_edit_minute(callback: types.CallbackQuery, state: FSMContext):
     old_time = req.time
     req.date = data.get("new_date")
     req.time = f"{data['new_hour']}:{minute}"
+    req.planned_date = req.date
+    req.planned_time = req.time
 
     await finalize_user_edit_update(
         callback,
@@ -1073,6 +1402,38 @@ async def admin_all(callback: types.CallbackQuery):
     await callback.message.answer(text, reply_markup=kb.as_markup())
 
 
+def build_admin_request_view(req: Request, is_superadmin: bool):
+    status = get_status_label(req.status)
+    final_status = "Завершена" if req.completed_at else "Не завершена"
+    plan_date = req.planned_date.strftime('%d.%m.%Y') if req.planned_date else req.date.strftime('%d.%m.%Y')
+    plan_time = req.planned_time if req.planned_time else req.time
+    text = (
+        f"<b>📄 Заявка #{req.id}</b>\n"
+        f"Статус: {status}\n\n"
+        f"🏢 <b>Постачальник:</b> {req.supplier}\n"
+        f"👤 <b>Водій:</b> {req.driver_name}\n"
+        f"📞 <b>Телефон:</b> {req.phone}\n"
+        f"🚚 <b>Авто:</b> {req.car}\n"
+        f"📦 <b>Тип вантажу:</b> {req.cargo_type}\n"
+        f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
+        f"📅 <b>План:</b> {plan_date} {plan_time}\n"
+        f"✅ <b>Підтверджено:</b> {req.date.strftime('%d.%m.%Y')} {req.time}\n"
+        f"🏁 <b>Завершення:</b> {final_status}"
+    )
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✔ Підтвердити", callback_data=f"adm_ok_{req.id}")
+    kb.button(text="🔁 Змінити дату/час", callback_data=f"adm_change_{req.id}")
+    kb.button(text="❌ Відхилити", callback_data=f"adm_rej_{req.id}")
+    if req.status == "approved" and not req.completed_at:
+        kb.button(text="🏁 Завершити поставку", callback_data=f"adm_finish_{req.id}")
+    if is_superadmin or req.status != "new":
+        kb.button(text="🗑 Видалити", callback_data=f"adm_del_{req.id}")
+    kb.button(text="⬅️ До списку", callback_data="admin_all")
+    kb.adjust(1)
+    kb = add_inline_navigation(kb)
+    return text, kb.as_markup()
+
+
 @dp.callback_query(F.data.startswith("admin_view_"))
 async def admin_view(callback: types.CallbackQuery):
     req_id = int(callback.data.split("_")[2])
@@ -1094,40 +1455,68 @@ async def admin_view(callback: types.CallbackQuery):
     if not (is_superadmin or admin):
         return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
 
-    status = get_status_label(req.status)
+    text, markup = build_admin_request_view(req, is_superadmin)
 
-    text = (
-        f"<b>📄 Заявка #{req.id}</b>\n"
-        f"Статус: {status}\n\n"
-        f"🏢 <b>Постачальник:</b> {req.supplier}\n"
-        f"👤 <b>Водій:</b> {req.driver_name}\n"
-        f"📞 <b>Телефон:</b> {req.phone}\n"
-        f"🚚 <b>Авто:</b> {req.car}\n"
-        f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
-        f"📅 <b>Дата:</b> {req.date.strftime('%d.%m.%Y')}\n"
-        f"⏰ <b>Час:</b> {req.time}"
+    await send_docs_and_text(
+        callback.message,
+        parse_doc_ids(req.docs_file_id),
+        text,
+        markup=markup,
     )
 
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✔ Підтвердити", callback_data=f"adm_ok_{req.id}")
-    kb.button(text="🔁 Змінити дату/час", callback_data=f"adm_change_{req.id}")
-    kb.button(text="❌ Відхилити", callback_data=f"adm_rej_{req.id}")
-    if is_superadmin or req.status != "new":
-        kb.button(text="🗑 Видалити", callback_data=f"adm_del_{req.id}")
-    kb.button(text="⬅️ До списку", callback_data="admin_all")
-    kb.adjust(1)
-    kb = add_inline_navigation(kb)
-
-    if req.docs_file_id:
-        await callback.message.answer_photo(
-            req.docs_file_id,
-            caption=text,
-            reply_markup=kb.as_markup(),
-        )
-    else:
-        await callback.message.answer(text, reply_markup=kb.as_markup())
-
     await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_search")
+async def admin_search_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer(
+        "Введіть ID заявки для пошуку:",
+        reply_markup=navigation_keyboard(),
+    )
+    await state.set_state(AdminSearch.wait_id)
+    await callback.answer()
+
+
+@dp.message(AdminSearch.wait_id)
+async def admin_search_wait(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.clear()
+        await message.answer("Пошук скасовано.", reply_markup=navigation_keyboard(include_back=False))
+        return await show_main_menu(message, state)
+
+    try:
+        req_id = int(message.text.strip())
+    except ValueError:
+        return await message.answer("Будь ласка, введіть числовий ID заявки.")
+
+    user_id = message.from_user.id
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        admin = (
+            await session.execute(
+                select(Admin).where(Admin.telegram_id == user_id)
+            )
+        ).scalar_one_or_none()
+
+    is_superadmin = user_id == SUPERADMIN_ID or (admin and admin.is_superadmin)
+
+    if not (is_superadmin or admin):
+        await state.clear()
+        return await message.answer("⛔ Ви не адміністратор.")
+
+    if not req:
+        return await message.answer("Заявка не знайдена.")
+
+    text, markup = build_admin_request_view(req, is_superadmin)
+
+    await send_docs_and_text(
+        message,
+        parse_doc_ids(req.docs_file_id),
+        text,
+        markup=markup,
+    )
+
+    await state.clear()
 ###############################################################
 #             ADMIN — ADD ADMIN (FSM Aiogram 3 OK)            
 ###############################################################
@@ -1234,6 +1623,8 @@ async def admin_clear_yes(callback: types.CallbackQuery):
         await session.execute(delete(Request))
         await session.commit()
 
+    await sheet_client.clear_requests()
+
     await callback.message.answer("🗑 Усі заявки видалено!")
 
 
@@ -1261,7 +1652,7 @@ async def step_supplier(message: types.Message, state: FSMContext):
     await state.update_data(supplier=supplier)
 
     await message.answer(
-        "👤 <b>Крок 2/7</b>\nВведіть ПІБ водія:",
+        "👤 <b>Крок 2/8</b>\nВведіть ПІБ водія:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.driver_name)
@@ -1272,7 +1663,7 @@ async def step_driver_name(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.supplier)
         return await message.answer(
-            "🏢 <b>Крок 1/7</b>\nВкажіть назву постачальника:",
+            "🏢 <b>Крок 1/8</b>\nВкажіть назву постачальника:",
             reply_markup=navigation_keyboard(include_back=False)
         )
 
@@ -1283,7 +1674,7 @@ async def step_driver_name(message: types.Message, state: FSMContext):
     await state.update_data(driver_name=name)
 
     await message.answer(
-        "📞 <b>Крок 3/7</b>\nЗалиште контактний номер телефону:",
+        "📞 <b>Крок 3/8</b>\nЗалиште контактний номер телефону:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.phone)
@@ -1294,7 +1685,7 @@ async def step_phone(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.driver_name)
         return await message.answer(
-            "👤 <b>Крок 2/7</b>\nВведіть ПІБ водія:",
+            "👤 <b>Крок 2/8</b>\nВведіть ПІБ водія:",
             reply_markup=navigation_keyboard()
         )
 
@@ -1305,7 +1696,7 @@ async def step_phone(message: types.Message, state: FSMContext):
     await state.update_data(phone=phone)
 
     await message.answer(
-        "🚚 <b>Крок 4/7</b>\nВведіть марку та номер авто:",
+        "🚚 <b>Крок 4/8</b>\nВведіть марку та номер авто:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.car)
@@ -1316,7 +1707,7 @@ async def step_car(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.phone)
         return await message.answer(
-            "📞 <b>Крок 3/7</b>\nЗалиште контактний номер телефону:",
+            "📞 <b>Крок 3/8</b>\nЗалиште контактний номер телефону:",
             reply_markup=navigation_keyboard()
         )
 
@@ -1332,7 +1723,7 @@ async def step_car(message: types.Message, state: FSMContext):
     kb.adjust(1)
 
     await message.answer(
-        "📎 <b>Крок 5/7</b>\nДодайте фото документів або пропустіть:",
+        "📎 <b>Крок 5/8</b>\nДодайте фото документів або пропустіть:",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
     )
 
@@ -1361,7 +1752,7 @@ async def back_to_car(callback: types.CallbackQuery, state: FSMContext):
 async def docs_back(message: types.Message, state: FSMContext):
     await state.set_state(QueueForm.car)
     await message.answer(
-        "🚚 <b>Крок 4/7</b>\nВведіть марку та номер авто:",
+        "🚚 <b>Крок 4/8</b>\nВведіть марку та номер авто:",
         reply_markup=navigation_keyboard()
     )
 
@@ -1370,14 +1761,17 @@ async def docs_back(message: types.Message, state: FSMContext):
 @dp.message(QueueForm.docs, F.photo)
 async def photo_received(message: types.Message, state: FSMContext):
     file_id = message.photo[-1].file_id
-    await state.update_data(docs_file_id=file_id)
+    data = await state.get_data()
+    docs = data.get("docs_file_ids", [])
+    docs.append(file_id)
+    await state.update_data(docs_file_ids=docs)
 
     kb = InlineKeyboardBuilder()
     kb.button(text="⏭ Далі", callback_data="photo_done")
     kb.adjust(1)
 
     await message.answer(
-        "✅ Фото додано. Продовжуємо оформлення.",
+        "✅ Фото додано. Можете надіслати ще або натиснути 'Далі'.",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
     )
 
@@ -1386,36 +1780,57 @@ async def photo_received(message: types.Message, state: FSMContext):
 @dp.callback_query(QueueForm.docs, F.data == "photo_done")
 async def photo_done(callback: types.CallbackQuery, state: FSMContext):
 
+    await callback.message.answer(
+        "📦 <b>Крок 6/8</b>\nВкажіть тип вантажу:",
+        reply_markup=navigation_keyboard()
+    )
+
+    await state.set_state(QueueForm.cargo_type)
+
+
+@dp.message(QueueForm.cargo_type)
+async def step_cargo_type(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="📸 Завантажити фото документів", callback_data="photo_upload")
+        kb.button(text="⏭ Пропустити", callback_data="photo_skip")
+        kb.adjust(1)
+        await state.set_state(QueueForm.docs)
+        return await message.answer(
+            "📎 <b>Крок 5/8</b>\nДодайте фото документів або пропустіть:",
+            reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup(),
+        )
+
+    cargo = message.text.strip()
+    if not cargo:
+        return await message.answer("Вкажіть тип вантажу, щоб продовжити.")
+
+    await state.update_data(cargo_type=cargo)
+
     kb = InlineKeyboardBuilder()
     kb.button(text="🚚 На палетах", callback_data="type_pal")
     kb.button(text="📦 В розсип", callback_data="type_loose")
     kb.adjust(1)
 
-    await callback.message.answer(
-        "⚙️ <b>Крок 6/7</b>\nОберіть тип завантаження:",
-        reply_markup=add_inline_navigation(kb, back_callback="back_to_docs").as_markup()
+    await message.answer(
+        "⚙️ <b>Крок 7/8</b>\nОберіть тип завантаження:",
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_cargo").as_markup(),
     )
 
     await state.set_state(QueueForm.loading_type)
 
-@dp.callback_query(QueueForm.loading_type, F.data == "back_to_docs")
+@dp.callback_query(QueueForm.loading_type, F.data == "back_to_cargo")
 async def loading_back(callback: types.CallbackQuery, state: FSMContext):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📸 Завантажити документи", callback_data="photo_upload")
-    kb.button(text="⏭ Пропустити", callback_data="photo_skip")
-    kb.adjust(1)
-
-    await state.set_state(QueueForm.docs)
+    await state.set_state(QueueForm.cargo_type)
     await callback.message.answer(
-        "📎 <b>Крок 5/7</b>\nДодайте фото документів або пропустіть:",
-        reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup()
+        "📦 <b>Крок 6/8</b>\nВкажіть тип вантажу:",
+        reply_markup=navigation_keyboard(),
     )
     await callback.answer()
 
 
-
 ###############################################################
-#                 LOADING TYPE → DATE                         
+#                 LOADING TYPE → DATE
 ###############################################################
 
 @dp.callback_query(QueueForm.loading_type)
@@ -1430,7 +1845,7 @@ async def step_loading(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(loading_type=t)
 
     await callback.message.answer(
-        "📅 <b>Крок 7/7</b>\nОберіть дату та час візиту:",
+        "📅 <b>Крок 8/8</b>\nОберіть дату та час візиту:",
         reply_markup=build_date_calendar(back_callback="back_to_loading")
     )
 
@@ -1533,7 +1948,7 @@ async def cal_back_to_loading(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(QueueForm.loading_type)
     await callback.message.answer(
         "🔹 Оберіть тип завантаження:",
-        reply_markup=add_inline_navigation(kb, back_callback="back_to_docs").as_markup()
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_cargo").as_markup()
     )
     await callback.answer()
 
@@ -1577,7 +1992,7 @@ async def back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
 
     await state.set_state(QueueForm.calendar)
     await callback.message.answer(
-        "📅 <b>Крок 7/7</b>\nОберіть дату та час візиту:", reply_markup=markup
+        "📅 <b>Крок 8/8</b>\nОберіть дату та час візиту:", reply_markup=markup
     )
     await callback.answer()
 
@@ -1612,12 +2027,16 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
             driver_name=data["driver_name"],
             phone=data["phone"],
             car=data["car"],
-            docs_file_id=data.get("docs_file_id"),
+            docs_file_id=serialize_doc_ids(data.get("docs_file_ids", [])),
+            cargo_type=data.get("cargo_type"),
             loading_type=data["loading_type"],
+            planned_date=data["date"],
+            planned_time=f"{data['hour']}:{minute}",
             date=data["date"],
             time=f"{data['hour']}:{minute}",
             status="new",
-            created_at=datetime.utcnow()
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
         )
 
         session.add(req)
@@ -1629,6 +2048,8 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
         f"📅 {req.date.strftime('%d.%m.%Y')} • ⏰ {req.time}",
         reply_markup=navigation_keyboard(include_back=False)
     )
+
+    await sheet_client.sync_request(req)
 
     # Рассылка всем админам
     await broadcast_new_request(req.id)
@@ -1667,9 +2088,10 @@ async def broadcast_new_request(req_id: int):
         f"👤 <b>Водій:</b> {req.driver_name}\n"
         f"📞 <b>Контакт:</b> {req.phone}\n"
         f"🚚 <b>Авто:</b> {req.car}\n"
-        f"🧱 <b>Тип:</b> {req.loading_type}\n"
-        f"📅 <b>Дата:</b> {req.date.strftime('%d.%m.%Y')}\n"
-        f"⏰ <b>Час:</b> {req.time}\n"
+        f"📦 <b>Тип вантажу:</b> {req.cargo_type}\n"
+        f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
+        f"📅 <b>План:</b> {req.planned_date.strftime('%d.%m.%Y')}\n"
+        f"⏰ <b>Час:</b> {req.planned_time}\n"
     )
 
     for admin in admins:
@@ -1681,8 +2103,13 @@ async def broadcast_new_request(req_id: int):
 
         try:
             await bot.send_message(admin.telegram_id, text, reply_markup=kb.as_markup())
-            if req.docs_file_id:
-                await bot.send_photo(admin.telegram_id, req.docs_file_id)
+            doc_ids = parse_doc_ids(req.docs_file_id)
+            if doc_ids:
+                if len(doc_ids) == 1:
+                    await bot.send_photo(admin.telegram_id, doc_ids[0])
+                else:
+                    media = [InputMediaPhoto(media=doc_id) for doc_id in doc_ids]
+                    await bot.send_media_group(admin.telegram_id, media)
         except:
             pass
 ###############################################################
@@ -1697,9 +2124,12 @@ async def adm_ok(callback: types.CallbackQuery):
         req = await session.get(Request, req_id)
         req.status = "approved"
         req.admin_id = callback.from_user.id
+        set_updated_now(req)
         await session.commit()
 
     await callback.message.answer("✔ Підтверджено!")
+
+    await sheet_client.sync_request(req)
 
     # Уведомление водителю
     await bot.send_message(
@@ -1720,9 +2150,12 @@ async def adm_rej(callback: types.CallbackQuery):
         req = await session.get(Request, req_id)
         req.status = "rejected"
         req.admin_id = callback.from_user.id
+        set_updated_now(req)
         await session.commit()
 
     await callback.message.answer("❌ Відхилено!")
+
+    await sheet_client.sync_request(req)
 
     await bot.send_message(
         req.user_id,
@@ -1730,6 +2163,33 @@ async def adm_rej(callback: types.CallbackQuery):
     )
 
     await notify_admins_about_action(req, "відхилена")
+
+
+@dp.callback_query(F.data.startswith("adm_finish_"))
+async def adm_finish(callback: types.CallbackQuery):
+    req_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
+    async with SessionLocal() as session:
+        admin = (
+            await session.execute(
+                select(Admin).where(Admin.telegram_id == user_id)
+            )
+        ).scalar_one_or_none()
+
+    is_superadmin = user_id == SUPERADMIN_ID or (admin and admin.is_superadmin)
+    if not (is_superadmin or admin):
+        return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
+
+    req = await complete_request(req_id, auto=False)
+    if not req:
+        return await callback.answer(
+            "Не можна завершити: заявка не підтверджена або вже завершена.",
+            show_alert=True,
+        )
+
+    await callback.message.answer("🏁 Заявка позначена як завершена.")
+    await callback.answer()
 @dp.callback_query(F.data.startswith("adm_del_"))
 async def adm_delete(callback: types.CallbackQuery):
     req_id = int(callback.data.split("_")[2])
@@ -1759,6 +2219,8 @@ async def adm_delete(callback: types.CallbackQuery):
 
         await session.delete(req)
         await session.commit()
+
+    await sheet_client.delete_request(req)
 
     await callback.message.answer("🗑 Заявку видалено з бази.")
     await callback.answer()
@@ -1889,10 +2351,14 @@ async def adm_min(callback: types.CallbackQuery, state: FSMContext):
         req = await session.get(Request, req_id)
         req.date = new_date
         req.time = new_time
+        req.status = "approved"
         req.admin_id = callback.from_user.id
+        set_updated_now(req)
         await session.commit()
 
     await callback.message.answer("🔁 Дата/час успішно змінені!")
+
+    await sheet_client.sync_request(req)
 
     # Уведомление водителю
     await bot.send_message(
@@ -1915,11 +2381,16 @@ async def notify_admins_about_action(req: Request, action: str):
     async with SessionLocal() as session:
         admins = (await session.execute(select(Admin))).scalars().all()
 
+    final_status = "Завершена" if req.completed_at else "Не завершена"
     text = (
         f"ℹ️ <b>Заявка #{req.id} {action}</b>\n\n"
         f"📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}\n"
         f"👤 {req.driver_name}\n"
-        f"🏢 {req.supplier}"
+        f"🏢 {req.supplier}\n"
+        f"🚚 {req.car}\n"
+        f"📦 {req.cargo_type}\n"
+        f"🧱 {req.loading_type}\n"
+        f"🏁 {final_status}"
     )
 
     for a in admins:
@@ -1952,6 +2423,67 @@ async def notify_admins_about_user_edit(
             await bot.send_message(admin.telegram_id, text)
         except:
             pass
+
+
+###############################################################
+#                 COMPLETE & AUTO-CLOSE REQUESTS
+###############################################################
+
+COMPLETION_MESSAGE = (
+    "Заявка #{} завершена. Гарної Вам дороги та дякую за співпрацю."
+)
+
+
+async def complete_request(req_id: int, *, auto: bool = False) -> Request | None:
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.completed_at or req.status != "approved":
+            return None
+
+        req.completed_at = datetime.utcnow()
+        set_updated_now(req)
+        await session.commit()
+        await session.refresh(req)
+
+    await sheet_client.sync_request(req)
+
+    try:
+        await bot.send_message(req.user_id, COMPLETION_MESSAGE.format(req.id))
+    except Exception:
+        pass
+
+    await notify_admins_about_action(
+        req, "завершена автоматично" if auto else "завершена"
+    )
+    return req
+
+
+async def auto_close_overdue_requests():
+    while True:
+        try:
+            await _auto_close_tick()
+        except Exception as exc:
+            logging.exception("Помилка автозакриття заявок: %s", exc)
+        await asyncio.sleep(300)
+
+
+async def _auto_close_tick():
+    now = datetime.utcnow()
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(Request).where(
+                Request.status == "approved",
+                Request.completed_at.is_(None),
+            )
+        )
+        requests = res.scalars().all()
+
+    for req in requests:
+        approved_at = req.updated_at or req.created_at
+        if not approved_at:
+            continue
+        if now >= approved_at + timedelta(hours=20):
+            await complete_request(req.id, auto=True)
             
 ###############################################################
 #                         BOT STARTUP                         
@@ -1969,6 +2501,7 @@ async def main():
             session.add(Admin(telegram_id=SUPERADMIN_ID, is_superadmin=True))
             await session.commit()
 
+    asyncio.create_task(auto_close_overdue_requests())
     print("Bot started!")
     await dp.start_polling(bot)
 
