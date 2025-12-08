@@ -374,16 +374,28 @@ def main_menu():
     kb.adjust(1)
     return kb.as_markup()
 
-def admin_menu():
+def admin_menu(is_superadmin: bool = False):
     kb = InlineKeyboardBuilder()
     kb.button(text="🆕 Нові заявки", callback_data="admin_new")
     kb.button(text="📚 Усі заявки", callback_data="admin_all")
     kb.button(text="🔎 Пошук за ID", callback_data="admin_search")
-    kb.button(text="➕ Додати адміна", callback_data="admin_add")
-    kb.button(text="➖ Видалити адміна", callback_data="admin_remove")
-    kb.button(text="🗑 Очистити БД", callback_data="admin_clear")
+    if is_superadmin:
+        kb.button(text="➕ Додати адміна", callback_data="admin_add")
+        kb.button(text="➖ Видалити адміна", callback_data="admin_remove")
+        kb.button(text="🗑 Очистити БД", callback_data="admin_clear")
     kb.adjust(1)
     return add_inline_navigation(kb).as_markup()
+
+
+async def is_super_admin_user(user_id: int) -> bool:
+    if user_id == SUPERADMIN_ID:
+        return True
+
+    async with SessionLocal() as session:
+        res = await session.execute(select(Admin).where(Admin.telegram_id == user_id))
+        admin = res.scalar_one_or_none()
+
+    return bool(admin and admin.is_superadmin)
 
 
 ###############################################################
@@ -1316,22 +1328,19 @@ async def user_edit_minute(callback: types.CallbackQuery, state: FSMContext):
 async def menu_admin_handler(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
-    if user_id == SUPERADMIN_ID:
-        return await callback.message.answer(
-            "🛠 <b>Адмін-панель</b>\nКеруйте заявками та доступами:",
-            reply_markup=admin_menu(),
-        )
+    is_superadmin = await is_super_admin_user(user_id)
 
-    async with SessionLocal() as session:
-        res = await session.execute(select(Admin).where(Admin.telegram_id == user_id))
-        admin = res.scalar_one_or_none()
+    if not is_superadmin:
+        async with SessionLocal() as session:
+            res = await session.execute(select(Admin).where(Admin.telegram_id == user_id))
+            admin = res.scalar_one_or_none()
 
-    if not admin:
-        return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
+        if not admin:
+            return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
 
     await callback.message.answer(
         "🛠 <b>Адмін-панель</b>\nКеруйте заявками та доступами:",
-        reply_markup=admin_menu(),
+        reply_markup=admin_menu(is_superadmin=is_superadmin),
     )
 
 
@@ -1523,6 +1532,12 @@ async def admin_search_wait(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "admin_add")
 async def admin_add(callback: types.CallbackQuery, state: FSMContext):
+    if not await is_super_admin_user(callback.from_user.id):
+        return await callback.answer(
+            "⛔ Тільки суперадмін може керувати адміністраторами.",
+            show_alert=True,
+        )
+
     await callback.message.answer(
         "➕ Введіть Telegram ID користувача:",
         reply_markup=navigation_keyboard()
@@ -1532,6 +1547,13 @@ async def admin_add(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AdminAdd.wait_id)
 async def admin_add_wait(message: types.Message, state: FSMContext):
+    if not await is_super_admin_user(message.from_user.id):
+        await state.clear()
+        return await message.answer(
+            "⛔ Тільки суперадмін може керувати адміністраторами.",
+            reply_markup=navigation_keyboard(include_back=False),
+        )
+
     if message.text == BACK_TEXT:
         await state.clear()
         await message.answer("Скасовано.", reply_markup=navigation_keyboard(include_back=False))
@@ -1565,6 +1587,12 @@ async def admin_add_wait(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "admin_remove")
 async def admin_remove(callback: types.CallbackQuery, state: FSMContext):
+    if not await is_super_admin_user(callback.from_user.id):
+        return await callback.answer(
+            "⛔ Тільки суперадмін може керувати адміністраторами.",
+            show_alert=True,
+        )
+
     await callback.message.answer(
         "➖ Введіть Telegram ID адміністратора для видалення:",
         reply_markup=navigation_keyboard()
@@ -1574,6 +1602,13 @@ async def admin_remove(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AdminRemove.wait_id)
 async def admin_remove_wait(message: types.Message, state: FSMContext):
+    if not await is_super_admin_user(message.from_user.id):
+        await state.clear()
+        return await message.answer(
+            "⛔ Тільки суперадмін може керувати адміністраторами.",
+            reply_markup=navigation_keyboard(include_back=False),
+        )
+
     if message.text == BACK_TEXT:
         await state.clear()
         await message.answer("Скасовано.", reply_markup=navigation_keyboard(include_back=False))
@@ -1602,7 +1637,7 @@ async def admin_remove_wait(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "admin_clear")
 async def admin_clear(callback: types.CallbackQuery):
 
-    if callback.from_user.id != SUPERADMIN_ID:
+    if not await is_super_admin_user(callback.from_user.id):
         return await callback.answer("⛔ Тільки суперадмін!", show_alert=True)
 
     kb = InlineKeyboardBuilder()
@@ -1619,6 +1654,9 @@ async def admin_clear(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "admin_clear_yes")
 async def admin_clear_yes(callback: types.CallbackQuery):
+    if not await is_super_admin_user(callback.from_user.id):
+        return await callback.answer("⛔ Тільки суперадмін!", show_alert=True)
+
     async with SessionLocal() as session:
         await session.execute(delete(Request))
         await session.commit()
@@ -2260,9 +2298,10 @@ async def adm_cal_next(callback: types.CallbackQuery):
 @dp.callback_query(AdminChangeForm.calendar, F.data == "admin_change_back")
 async def adm_change_back(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
+    is_superadmin = await is_super_admin_user(callback.from_user.id)
     await callback.message.answer(
         "Операцію зміни дати/часу скасовано.",
-        reply_markup=admin_menu()
+        reply_markup=admin_menu(is_superadmin=is_superadmin)
     )
     await callback.answer()
 
