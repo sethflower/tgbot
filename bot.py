@@ -1053,7 +1053,9 @@ async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContex
         await state.set_state(UserEditForm.calendar)
         await callback.message.answer(
             "Оберіть нову дату:",
-            reply_markup=build_date_calendar(back_callback="edit_back_to_choice"),
+            reply_markup=build_date_calendar(
+                back_callback="edit_back_to_choice", hide_sundays=True
+            ),
         )
     else:
         await callback.message.answer("Невідомий вибір.")
@@ -1064,7 +1066,9 @@ async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContex
 async def user_edit_prev(callback: types.CallbackQuery, state: FSMContext):
     _, y, m = callback.data.split("_")
     await callback.message.edit_reply_markup(
-        reply_markup=build_date_calendar(int(y), int(m), back_callback="edit_back_to_choice")
+        reply_markup=build_date_calendar(
+            int(y), int(m), back_callback="edit_back_to_choice", hide_sundays=True
+        )
     )
     await callback.answer()
 
@@ -1073,7 +1077,9 @@ async def user_edit_prev(callback: types.CallbackQuery, state: FSMContext):
 async def user_edit_next(callback: types.CallbackQuery, state: FSMContext):
     _, y, m = callback.data.split("_")
     await callback.message.edit_reply_markup(
-        reply_markup=build_date_calendar(int(y), int(m), back_callback="edit_back_to_choice")
+        reply_markup=build_date_calendar(
+            int(y), int(m), back_callback="edit_back_to_choice", hide_sundays=True
+        )
     )
     await callback.answer()
 
@@ -1104,6 +1110,11 @@ async def user_edit_day(callback: types.CallbackQuery, state: FSMContext):
 
     if chosen < kyiv_now().date():
         return await callback.answer("Не можна обирати минулі дати", show_alert=True)
+
+    if chosen.weekday() == 6:
+        return await callback.answer(
+            "Запис у неділю недоступний. Оберіть іншу дату.", show_alert=True
+        )
 
     await state.update_data(new_date=chosen)
 
@@ -1137,10 +1148,15 @@ async def user_edit_back_to_calendar(callback: types.CallbackQuery, state: FSMCo
 
     if chosen_date:
         markup = build_date_calendar(
-            chosen_date.year, chosen_date.month, back_callback="edit_back_to_choice"
+            chosen_date.year,
+            chosen_date.month,
+            back_callback="edit_back_to_choice",
+            hide_sundays=True,
         )
     else:
-        markup = build_date_calendar(back_callback="edit_back_to_choice")
+        markup = build_date_calendar(
+            back_callback="edit_back_to_choice", hide_sundays=True
+        )
 
     await state.set_state(UserEditForm.calendar)
     await callback.message.answer("Оберіть нову дату:", reply_markup=markup)
@@ -1850,7 +1866,9 @@ async def step_loading(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.answer(
         "📅 <b>Крок 5/5</b>\nОберіть дату та час візиту:",
-        reply_markup=build_date_calendar(back_callback="back_to_loading")
+        reply_markup=build_date_calendar(
+            back_callback="back_to_loading", hide_sundays=True
+        )
     )
 
     await state.set_state(QueueForm.calendar)
@@ -1860,7 +1878,13 @@ async def step_loading(callback: types.CallbackQuery, state: FSMContext):
 #                INLINE CALENDAR GENERATOR                    
 ###############################################################
 
-def build_date_calendar(year=None, month=None, back_callback: str | None = None):
+def build_date_calendar(
+    year=None,
+    month=None,
+    back_callback: str | None = None,
+    *,
+    hide_sundays: bool = False,
+):
     now = kyiv_now()
     today = now.date()
     year = year or today.year
@@ -1876,12 +1900,6 @@ def build_date_calendar(year=None, month=None, back_callback: str | None = None)
     # Заголовок месяца
     month_name = datetime(year, month, 1).strftime("%B %Y")
     kb.row(InlineKeyboardButton(text=f"📅 {month_name}", callback_data="ignore"))
-
-    # Дни недели
-    kb.row(*[
-        InlineKeyboardButton(text=d, callback_data="ignore")
-        for d in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
-    ])
 
     # День недели, с которого начинается месяц
     first_wday = datetime(year, month, 1, tzinfo=KYIV_TZ).weekday()  # Monday = 0
@@ -1904,9 +1922,12 @@ def build_date_calendar(year=None, month=None, back_callback: str | None = None)
             # Пропускаємо минулі дати, щоб користувач їх не бачив
             continue
 
-        row.append(
-            InlineKeyboardButton(text=str(d), callback_data=f"day_{year}_{month}_{d}")
-        )
+        if hide_sundays and day_date.weekday() == 6:
+            callback_data = "ignore"
+        else:
+            callback_data = f"day_{year}_{month}_{d}"
+
+        row.append(InlineKeyboardButton(text=str(d), callback_data=callback_data))
         if len(row) == 7:
             kb.row(*row)
             row = []
@@ -1985,7 +2006,9 @@ def all_slots_for_day(selected_date: date) -> list[str]:
 async def cal_prev(callback: types.CallbackQuery):
     _, y, m = callback.data.split("_")
     await callback.message.edit_reply_markup(
-        reply_markup=build_date_calendar(int(y), int(m), back_callback="back_to_loading")
+        reply_markup=build_date_calendar(
+            int(y), int(m), back_callback="back_to_loading", hide_sundays=True
+        )
     )
 
 
@@ -1993,7 +2016,9 @@ async def cal_prev(callback: types.CallbackQuery):
 async def cal_next(callback: types.CallbackQuery):
     _, y, m = callback.data.split("_")
     await callback.message.edit_reply_markup(
-        reply_markup=build_date_calendar(int(y), int(m), back_callback="back_to_loading")
+        reply_markup=build_date_calendar(
+            int(y), int(m), back_callback="back_to_loading", hide_sundays=True
+        )
     )
 
 @dp.callback_query(QueueForm.calendar, F.data == "back_to_loading")
@@ -2017,6 +2042,11 @@ async def cal_day(callback: types.CallbackQuery, state: FSMContext):
 
     if chosen < kyiv_now().date():
         return await callback.answer("Не можна обирати минулі дати", show_alert=True)
+
+    if chosen.weekday() == 6:
+        return await callback.answer(
+            "Запис у неділю недоступний. Оберіть іншу дату.", show_alert=True
+        )
 
     await state.update_data(date=chosen)
 
@@ -2056,10 +2086,13 @@ async def back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
         markup = build_date_calendar(
             chosen_date.year,
             chosen_date.month,
-            back_callback="back_to_loading"
+            back_callback="back_to_loading",
+            hide_sundays=True,
         )
     else:
-        markup = build_date_calendar(back_callback="back_to_loading")
+        markup = build_date_calendar(
+            back_callback="back_to_loading", hide_sundays=True
+        )
 
     await state.set_state(QueueForm.calendar)
     await callback.message.answer(
