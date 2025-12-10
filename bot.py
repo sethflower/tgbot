@@ -57,6 +57,41 @@ def kyiv_now() -> datetime:
 def kyiv_now_naive() -> datetime:
     return kyiv_now().replace(tzinfo=None)
 
+def to_kyiv(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=KYIV_TZ)
+    return dt.astimezone(KYIV_TZ)
+
+def min_planned_datetime(base: datetime | None = None) -> datetime:
+    return to_kyiv(base or kyiv_now()) + timedelta(hours=1)
+
+def get_min_date_from_state(data: dict[str, Any]) -> date | None:
+    raw = data.get("min_plan_dt")
+    if isinstance(raw, str):
+        try:
+            raw_dt = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+    elif isinstance(raw, datetime):
+        raw_dt = raw
+    else:
+        return None
+    return to_kyiv(raw_dt).date()
+
+
+def get_min_datetime_from_state(data: dict[str, Any]) -> datetime | None:
+    raw = data.get("min_plan_dt")
+    if isinstance(raw, str):
+        try:
+            raw_dt = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+    elif isinstance(raw, datetime):
+        raw_dt = raw
+    else:
+        return None
+    return to_kyiv(raw_dt)
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPERADMIN_ID = int(os.getenv("SUPERADMIN_ID"))
@@ -1050,11 +1085,18 @@ async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContex
             reply_markup=add_inline_navigation(kb, back_callback="edit_back_to_choice").as_markup(),
         )
     elif choice == "datetime":
+        req, _ = await _load_request_for_edit(state, callback.from_user.id)
+        if not req:
+            return await callback.answer("Заявка не знайдена", show_alert=True)
+        min_dt = min_planned_datetime(req.created_at)
+        await state.update_data(min_plan_dt=min_dt.isoformat())
         await state.set_state(UserEditForm.calendar)
         await callback.message.answer(
             "Оберіть нову дату:",
             reply_markup=build_date_calendar(
-                back_callback="edit_back_to_choice", hide_sundays=True
+                back_callback="edit_back_to_choice",
+                hide_sundays=True,
+                min_date=min_dt.date(),
             ),
         )
     else:
@@ -1065,9 +1107,15 @@ async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContex
 @dp.callback_query(UserEditForm.calendar, F.data.startswith("prev_"))
 async def user_edit_prev(callback: types.CallbackQuery, state: FSMContext):
     _, y, m = callback.data.split("_")
+    data = await state.get_data()
+    min_date = get_min_date_from_state(data)
     await callback.message.edit_reply_markup(
         reply_markup=build_date_calendar(
-            int(y), int(m), back_callback="edit_back_to_choice", hide_sundays=True
+            int(y),
+            int(m),
+            back_callback="edit_back_to_choice",
+            hide_sundays=True,
+            min_date=min_date,
         )
     )
     await callback.answer()
@@ -1076,9 +1124,15 @@ async def user_edit_prev(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(UserEditForm.calendar, F.data.startswith("next_"))
 async def user_edit_next(callback: types.CallbackQuery, state: FSMContext):
     _, y, m = callback.data.split("_")
+    data = await state.get_data()
+    min_date = get_min_date_from_state(data)
     await callback.message.edit_reply_markup(
         reply_markup=build_date_calendar(
-            int(y), int(m), back_callback="edit_back_to_choice", hide_sundays=True
+            int(y),
+            int(m),
+            back_callback="edit_back_to_choice",
+            hide_sundays=True,
+            min_date=min_date,
         )
     )
     await callback.answer()
@@ -1107,9 +1161,18 @@ async def user_edit_back_to_choice(callback: types.CallbackQuery, state: FSMCont
 async def user_edit_day(callback: types.CallbackQuery, state: FSMContext):
     _, y, m, d = callback.data.split("_")
     chosen = date(int(y), int(m), int(d))
+    data = await state.get_data()
+    min_date = get_min_date_from_state(data)
+    min_dt = get_min_datetime_from_state(data)
 
     if chosen < kyiv_now().date():
         return await callback.answer("Не можна обирати минулі дати", show_alert=True)
+
+    if min_date and chosen < min_date:
+        return await callback.answer(
+            "Можна обрати час не раніше ніж через 1 годину після створення заявки.",
+            show_alert=True,
+        )
 
     if chosen.weekday() == 6:
         return await callback.answer(
@@ -1119,7 +1182,7 @@ async def user_edit_day(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(new_date=chosen)
 
     kb = InlineKeyboardBuilder()
-    hours = available_hours(chosen)
+    hours = available_hours(chosen, earliest_dt=min_dt)
     for hour in hours:
         kb.button(text=f"{hour:02d}", callback_data=f"uhour_{hour:02d}")
     kb.adjust(6)
@@ -1145,6 +1208,7 @@ async def user_edit_day(callback: types.CallbackQuery, state: FSMContext):
 async def user_edit_back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     chosen_date: date | None = data.get("new_date")
+    min_date = get_min_date_from_state(data)
 
     if chosen_date:
         markup = build_date_calendar(
@@ -1152,10 +1216,11 @@ async def user_edit_back_to_calendar(callback: types.CallbackQuery, state: FSMCo
             chosen_date.month,
             back_callback="edit_back_to_choice",
             hide_sundays=True,
+            min_date=min_date,
         )
     else:
         markup = build_date_calendar(
-            back_callback="edit_back_to_choice", hide_sundays=True
+            back_callback="edit_back_to_choice", hide_sundays=True, min_date=min_date
         )
 
     await state.set_state(UserEditForm.calendar)
@@ -1168,18 +1233,19 @@ async def user_edit_hour(callback: types.CallbackQuery, state: FSMContext):
     hour = callback.data.replace("uhour_", "")
     data = await state.get_data()
     chosen_date: date | None = data.get("new_date")
+    min_dt = get_min_datetime_from_state(data)
 
     if not chosen_date:
         return await callback.answer("Оберіть дату", show_alert=True)
 
-    valid_hours = {f"{h:02d}" for h in available_hours(chosen_date)}
+    valid_hours = {f"{h:02d}" for h in available_hours(chosen_date, earliest_dt=min_dt)}
     if hour not in valid_hours:
         return await callback.answer("Цей час вже недоступний", show_alert=True)
 
     await state.update_data(new_hour=hour)
 
     kb = InlineKeyboardBuilder()
-    for m in available_minutes(chosen_date, int(hour)):
+    for m in available_minutes(chosen_date, int(hour), earliest_dt=min_dt):
         kb.button(text=f"{m:02d}", callback_data=f"umin_{m:02d}")
     kb.adjust(6)
 
@@ -1195,10 +1261,11 @@ async def user_edit_hour(callback: types.CallbackQuery, state: FSMContext):
 async def user_edit_back_to_hour(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     chosen_date: date | None = data.get("new_date")
+    min_dt = get_min_datetime_from_state(data)
 
     kb = InlineKeyboardBuilder()
     if chosen_date:
-        hours = available_hours(chosen_date)
+        hours = available_hours(chosen_date, earliest_dt=min_dt)
         for hour in hours:
             kb.button(text=f"{hour:02d}", callback_data=f"uhour_{hour:02d}")
     kb.adjust(6)
@@ -1218,19 +1285,44 @@ async def user_edit_minute(callback: types.CallbackQuery, state: FSMContext):
 
     chosen_date: date | None = data.get("new_date")
     chosen_hour = data.get("new_hour")
+    min_dt = get_min_datetime_from_state(data)
+
+    if min_dt:
+        min_date = min_dt.date()
+    else:
+        min_date = None
 
     if not chosen_date or chosen_date < kyiv_now().date():
         return await callback.answer("Оберіть доступну дату", show_alert=True)
 
+    if min_date and chosen_date < min_date:
+        return await callback.answer(
+            "Можна обрати час не раніше ніж через 1 годину після створення заявки.",
+            show_alert=True,
+        )
+
     if chosen_hour is None:
         return await callback.answer("Спочатку оберіть годину", show_alert=True)
 
-    if int(minute) not in available_minutes(chosen_date, int(chosen_hour)):
+    if int(minute) not in available_minutes(
+        chosen_date, int(chosen_hour), earliest_dt=min_dt
+    ):
         return await callback.answer("Цей час вже недоступний", show_alert=True)
 
     req, reason = await _load_request_for_edit(state, callback.from_user.id)
     if not req:
         return await callback.answer("Заявка не знайдена", show_alert=True)
+
+    planned_dt = to_kyiv(
+        datetime.combine(chosen_date, dtime(hour=int(chosen_hour), minute=int(minute)))
+    )
+
+    min_allowed = min_dt or min_planned_datetime(req.created_at)
+    if planned_dt < min_allowed:
+        return await callback.answer(
+            "Можна обрати час не раніше ніж через 1 годину після створення заявки.",
+            show_alert=True,
+        )
 
     old_date = req.date
     old_time = req.time
@@ -1862,12 +1954,13 @@ async def step_loading(callback: types.CallbackQuery, state: FSMContext):
     else:
         return await callback.answer("Невідомий варіант!")
 
-    await state.update_data(loading_type=t)
+    min_dt = min_planned_datetime()
+    await state.update_data(loading_type=t, min_plan_dt=min_dt.isoformat())
 
     await callback.message.answer(
         "📅 <b>Крок 5/5</b>\nОберіть дату та час візиту:",
         reply_markup=build_date_calendar(
-            back_callback="back_to_loading", hide_sundays=True
+            back_callback="back_to_loading", hide_sundays=True, min_date=min_dt.date()
         )
     )
 
@@ -1884,9 +1977,10 @@ def build_date_calendar(
     back_callback: str | None = None,
     *,
     hide_sundays: bool = False,
+    min_date: date | None = None,
 ):
     now = kyiv_now()
-    today = now.date()
+    today = min_date or now.date()
     year = year or today.year
     month = month or today.month
 
@@ -1965,14 +2059,27 @@ def build_date_calendar(
     return kb.as_markup()
 
 
-def available_minutes(selected_date: date, hour: int, *, now_dt: datetime | None = None) -> list[int]:
+def available_minutes(
+    selected_date: date,
+    hour: int,
+    *,
+    now_dt: datetime | None = None,
+    earliest_dt: datetime | None = None,
+) -> list[int]:
     now_dt = now_dt or kyiv_now()
+    earliest_dt = to_kyiv(earliest_dt) if earliest_dt else None
 
     if hour < 9 or hour > 16:
         return []
 
     # Години роботи: 09:00–16:00, остання година без хвилинної градації
     minutes = [0] if hour == 16 else list(range(0, 60, 5))
+
+    if earliest_dt and selected_date == earliest_dt.date():
+        if hour < earliest_dt.hour:
+            return []
+        if hour == earliest_dt.hour:
+            minutes = [m for m in minutes if m >= earliest_dt.minute]
 
     if selected_date == now_dt.date():
         current_time = now_dt.time()
@@ -1984,12 +2091,20 @@ def available_minutes(selected_date: date, hour: int, *, now_dt: datetime | None
     return minutes
 
 
-def available_hours(selected_date: date, *, now_dt: datetime | None = None) -> list[int]:
+def available_hours(
+    selected_date: date,
+    *,
+    now_dt: datetime | None = None,
+    earliest_dt: datetime | None = None,
+) -> list[int]:
     now_dt = now_dt or kyiv_now()
+    earliest_dt = to_kyiv(earliest_dt) if earliest_dt else None
     hours = []
 
     for hour in range(9, 17):
-        minutes = available_minutes(selected_date, hour, now_dt=now_dt)
+        minutes = available_minutes(
+            selected_date, hour, now_dt=now_dt, earliest_dt=earliest_dt
+        )
         if minutes:
             hours.append(hour)
 
@@ -2010,21 +2125,33 @@ def all_slots_for_day(selected_date: date) -> list[str]:
 ###############################################################
 
 @dp.callback_query(QueueForm.calendar, F.data.startswith("prev_"))
-async def cal_prev(callback: types.CallbackQuery):
+async def cal_prev(callback: types.CallbackQuery, state: FSMContext):
     _, y, m = callback.data.split("_")
+    data = await state.get_data()
+    min_date = get_min_date_from_state(data)
     await callback.message.edit_reply_markup(
         reply_markup=build_date_calendar(
-            int(y), int(m), back_callback="back_to_loading", hide_sundays=True
+            int(y),
+            int(m),
+            back_callback="back_to_loading",
+            hide_sundays=True,
+            min_date=min_date,
         )
     )
 
 
 @dp.callback_query(QueueForm.calendar, F.data.startswith("next_"))
-async def cal_next(callback: types.CallbackQuery):
+async def cal_next(callback: types.CallbackQuery, state: FSMContext):
     _, y, m = callback.data.split("_")
+    data = await state.get_data()
+    min_date = get_min_date_from_state(data)
     await callback.message.edit_reply_markup(
         reply_markup=build_date_calendar(
-            int(y), int(m), back_callback="back_to_loading", hide_sundays=True
+            int(y),
+            int(m),
+            back_callback="back_to_loading",
+            hide_sundays=True,
+            min_date=min_date,
         )
     )
 
@@ -2046,9 +2173,18 @@ async def cal_back_to_loading(callback: types.CallbackQuery, state: FSMContext):
 async def cal_day(callback: types.CallbackQuery, state: FSMContext):
     _, y, m, d = callback.data.split("_")
     chosen = date(int(y), int(m), int(d))
+    data = await state.get_data()
+    min_date = get_min_date_from_state(data)
+    min_dt = get_min_datetime_from_state(data)
 
     if chosen < kyiv_now().date():
         return await callback.answer("Не можна обирати минулі дати", show_alert=True)
+
+    if min_date and chosen < min_date:
+        return await callback.answer(
+            "Можна обрати час не раніше ніж через 1 годину після створення заявки.",
+            show_alert=True,
+        )
 
     if chosen.weekday() == 6:
         return await callback.answer(
@@ -2058,7 +2194,7 @@ async def cal_day(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(date=chosen)
 
     kb = InlineKeyboardBuilder()
-    hours = available_hours(chosen)
+    hours = available_hours(chosen, earliest_dt=min_dt)
     for hour in hours:
         kb.button(text=f"{hour:02d}", callback_data=f"hour_{hour:02d}")
     kb.adjust(6)
@@ -2088,6 +2224,7 @@ async def close_calendar(callback: types.CallbackQuery, state: FSMContext):
 async def back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     chosen_date: date | None = data.get("date")
+    min_date = get_min_date_from_state(data)
 
     if chosen_date:
         markup = build_date_calendar(
@@ -2095,10 +2232,11 @@ async def back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
             chosen_date.month,
             back_callback="back_to_loading",
             hide_sundays=True,
+            min_date=min_date,
         )
     else:
         markup = build_date_calendar(
-            back_callback="back_to_loading", hide_sundays=True
+            back_callback="back_to_loading", hide_sundays=True, min_date=min_date
         )
 
     await state.set_state(QueueForm.calendar)
@@ -2113,18 +2251,19 @@ async def hour_selected(callback: types.CallbackQuery, state: FSMContext):
     hour = callback.data.replace("hour_", "")
     data = await state.get_data()
     chosen_date: date | None = data.get("date")
+    min_dt = get_min_datetime_from_state(data)
 
     if not chosen_date:
         return await callback.answer("Оберіть дату", show_alert=True)
 
-    valid_hours = {f"{h:02d}" for h in available_hours(chosen_date)}
+    valid_hours = {f"{h:02d}" for h in available_hours(chosen_date, earliest_dt=min_dt)}
     if hour not in valid_hours:
         return await callback.answer("Цей час вже недоступний", show_alert=True)
 
     await state.update_data(hour=hour)
 
     kb = InlineKeyboardBuilder()
-    for m in available_minutes(chosen_date, int(hour)):
+    for m in available_minutes(chosen_date, int(hour), earliest_dt=min_dt):
         kb.button(text=f"{m:02d}", callback_data=f"min_{m:02d}")
     kb.adjust(6)
 
@@ -2143,6 +2282,7 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
 
     chosen_date: date | None = data.get("date")
     chosen_hour = data.get("hour")
+    min_dt = get_min_datetime_from_state(data) or min_planned_datetime()
 
     if not chosen_date or chosen_date < kyiv_now().date():
         return await callback.answer("Оберіть доступну дату", show_alert=True)
@@ -2151,9 +2291,20 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
         return await callback.answer("Спочатку оберіть годину", show_alert=True)
 
     selected_time = dtime(hour=int(chosen_hour), minute=int(minute))
-    if int(minute) not in available_minutes(chosen_date, int(chosen_hour)):
+    planned_dt = to_kyiv(datetime.combine(chosen_date, selected_time))
+
+    if planned_dt < min_dt:
+        return await callback.answer(
+            "Можна обрати час не раніше ніж через 1 годину після створення заявки.",
+            show_alert=True,
+        )
+
+    if int(minute) not in available_minutes(
+        chosen_date, int(chosen_hour), earliest_dt=min_dt
+    ):
         return await callback.answer("Цей час вже недоступний", show_alert=True)
 
+    creation_time = kyiv_now()
     async with SessionLocal() as session:
         req = Request(
             user_id=callback.from_user.id,
@@ -2166,8 +2317,8 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
             date=chosen_date,
             time=f"{int(chosen_hour):02d}:{int(minute):02d}",
             status="new",
-            created_at=kyiv_now_naive(),
-            updated_at=kyiv_now_naive(),
+            created_at=creation_time.replace(tzinfo=None),
+            updated_at=creation_time.replace(tzinfo=None),
         )
 
         session.add(req)
@@ -2191,10 +2342,11 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
 async def back_to_hour(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     chosen_date: date | None = data.get("date")
+    min_dt = get_min_datetime_from_state(data)
 
     kb = InlineKeyboardBuilder()
     if chosen_date:
-        hours = available_hours(chosen_date)
+        hours = available_hours(chosen_date, earliest_dt=min_dt)
         for hour in hours:
             kb.button(text=f"{hour:02d}", callback_data=f"hour_{hour:02d}")
     kb.adjust(6)
