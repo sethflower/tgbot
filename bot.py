@@ -399,7 +399,7 @@ def admin_menu(is_superadmin: bool = False):
     kb.button(text="🆕 Нові заявки", callback_data="admin_new")
     kb.button(text="📚 Усі заявки", callback_data="admin_all")
     kb.button(text="🔎 Пошук за ID", callback_data="admin_search")
-    kb.button(text="📅 План на сьогодні", callback_data="admin_today_plan")
+    kb.button(text="📅 Посмотреть слоты очереди", callback_data="admin_slots_view")
     if is_superadmin:
         kb.button(text="➕ Додати адміна", callback_data="admin_add")
         kb.button(text="➖ Видалити адміна", callback_data="admin_remove")
@@ -465,6 +465,9 @@ class AdminChangeForm(StatesGroup):
     calendar = State()
     hour = State()
     minute = State()
+
+class AdminPlanView(StatesGroup):
+    calendar = State()
 
 class UserDeleteForm(StatesGroup):
     user_id = State()
@@ -1329,30 +1332,27 @@ async def admin_all(callback: types.CallbackQuery):
     await callback.message.answer(text, reply_markup=kb.as_markup())
 
 
-@dp.callback_query(F.data == "admin_today_plan")
-async def admin_today_plan(callback: types.CallbackQuery):
-    today = kyiv_now().date()
-
+async def render_slots_overview(target_date: date) -> str:
     async with SessionLocal() as session:
         res = await session.execute(
             select(Request)
             .where(
-                Request.planned_date == today,
+                Request.planned_date == target_date,
                 ~Request.status.in_(["rejected", "deleted_by_user"]),
             )
         )
-        todays = res.scalars().all()
+        requests_for_day = res.scalars().all()
 
-    slots = all_slots_for_day(today)
+    slots = all_slots_for_day(target_date)
     busy: dict[str, list[Request]] = {}
-    for req in todays:
+    for req in requests_for_day:
         slot_time = req.planned_time or req.time
         if not slot_time:
             continue
         busy.setdefault(slot_time, []).append(req)
 
     lines = [
-        f"<b>📅 План на сьогодні ({today.strftime('%d.%m.%Y')})</b>",
+        f"<b>📅 Слоти на {target_date.strftime('%d.%m.%Y')}</b>",
         "Слоти 09:00–16:00 з кроком 5 хвилин:",
         "",
     ]
@@ -1368,10 +1368,64 @@ async def admin_today_plan(callback: types.CallbackQuery):
         else:
             lines.append(f"{slot} — ✅ Вільно")
 
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data == "admin_slots_view")
+async def admin_slots_view(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminPlanView.calendar)
+    await callback.message.answer(
+        "📅 Оберіть дату, щоб переглянути доступність слотів:",
+        reply_markup=build_date_calendar(back_callback="menu_admin"),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(AdminPlanView.calendar, F.data.startswith("prev_"))
+async def admin_slots_prev(callback: types.CallbackQuery):
+    _, y, m = callback.data.split("_")
+    await callback.message.edit_reply_markup(
+        reply_markup=build_date_calendar(int(y), int(m), back_callback="menu_admin")
+    )
+
+
+@dp.callback_query(AdminPlanView.calendar, F.data.startswith("next_"))
+async def admin_slots_next(callback: types.CallbackQuery):
+    _, y, m = callback.data.split("_")
+    await callback.message.edit_reply_markup(
+        reply_markup=build_date_calendar(int(y), int(m), back_callback="menu_admin")
+    )
+
+
+@dp.callback_query(AdminPlanView.calendar, F.data == "close_calendar")
+async def admin_slots_close(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("❌ Перегляд слотів скасовано.")
+    await callback.answer()
+
+
+@dp.callback_query(AdminPlanView.calendar, F.data.startswith("day_"))
+async def admin_slots_for_day(callback: types.CallbackQuery, state: FSMContext):
+    _, y, m, d = callback.data.split("_")
+    chosen_date = date(int(y), int(m), int(d))
+
+    overview = await render_slots_overview(chosen_date)
+
     kb = InlineKeyboardBuilder()
+    kb.button(text="📅 Обрати іншу дату", callback_data="admin_slots_choose_date")
     kb = add_inline_navigation(kb, back_callback="menu_admin")
 
-    await callback.message.answer("\n".join(lines), reply_markup=kb.as_markup())
+    await callback.message.answer(overview, reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_slots_choose_date")
+async def admin_slots_choose_date(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminPlanView.calendar)
+    await callback.message.answer(
+        "📅 Оберіть дату, щоб переглянути доступність слотів:",
+        reply_markup=build_date_calendar(back_callback="menu_admin"),
+    )
     await callback.answer()
 
 
