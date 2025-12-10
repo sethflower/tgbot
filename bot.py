@@ -399,6 +399,7 @@ def admin_menu(is_superadmin: bool = False):
     kb.button(text="🆕 Нові заявки", callback_data="admin_new")
     kb.button(text="📚 Усі заявки", callback_data="admin_all")
     kb.button(text="🔎 Пошук за ID", callback_data="admin_search")
+    kb.button(text="📅 План на сьогодні", callback_data="admin_today_plan")
     if is_superadmin:
         kb.button(text="➕ Додати адміна", callback_data="admin_add")
         kb.button(text="➖ Видалити адміна", callback_data="admin_remove")
@@ -1328,6 +1329,52 @@ async def admin_all(callback: types.CallbackQuery):
     await callback.message.answer(text, reply_markup=kb.as_markup())
 
 
+@dp.callback_query(F.data == "admin_today_plan")
+async def admin_today_plan(callback: types.CallbackQuery):
+    today = kyiv_now().date()
+
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(Request)
+            .where(
+                Request.planned_date == today,
+                ~Request.status.in_(["rejected", "deleted_by_user"]),
+            )
+        )
+        todays = res.scalars().all()
+
+    slots = all_slots_for_day(today)
+    busy: dict[str, list[Request]] = {}
+    for req in todays:
+        slot_time = req.planned_time or req.time
+        if not slot_time:
+            continue
+        busy.setdefault(slot_time, []).append(req)
+
+    lines = [
+        f"<b>📅 План на сьогодні ({today.strftime('%d.%m.%Y')})</b>",
+        "Слоти 09:00–16:00 з кроком 5 хвилин:",
+        "",
+    ]
+
+    for slot in slots:
+        requests_in_slot = busy.get(slot, [])
+        if requests_in_slot:
+            details = "; ".join(
+                f"{r.supplier} (#{r.id}, {get_status_label(r.status)})"
+                for r in requests_in_slot
+            )
+            lines.append(f"{slot} — 🚧 Зайнято: {details}")
+        else:
+            lines.append(f"{slot} — ✅ Вільно")
+
+    kb = InlineKeyboardBuilder()
+    kb = add_inline_navigation(kb, back_callback="menu_admin")
+
+    await callback.message.answer("\n".join(lines), reply_markup=kb.as_markup())
+    await callback.answer()
+
+
 def build_admin_request_view(req: Request, is_superadmin: bool):
     status = get_status_label(req.status)
     final_status = "Завершена" if req.completed_at else "Не завершена"
@@ -1865,6 +1912,15 @@ def available_hours(selected_date: date, *, now_dt: datetime | None = None) -> l
             hours.append(hour)
 
     return hours
+
+
+def all_slots_for_day(selected_date: date) -> list[str]:
+    slots: list[str] = []
+    for hour in range(9, 17):
+        minutes = [0] if hour == 16 else list(range(0, 60, 5))
+        for minute in minutes:
+            slots.append(f"{hour:02d}:{minute:02d}")
+    return slots
 
 
 ###############################################################
