@@ -1903,6 +1903,8 @@ def build_date_calendar(
 
     # День недели, с которого начинается месяц
     first_wday = datetime(year, month, 1, tzinfo=KYIV_TZ).weekday()  # Monday = 0
+    if hide_sundays and first_wday == 6:
+        first_wday = 0
 
     row = []
     for _ in range(first_wday):
@@ -1923,11 +1925,16 @@ def build_date_calendar(
             continue
 
         if hide_sundays and day_date.weekday() == 6:
-            callback_data = "ignore"
-        else:
-            callback_data = f"day_{year}_{month}_{d}"
+            if row:
+                kb.row(*row)
+                row = []
+            continue
 
-        row.append(InlineKeyboardButton(text=str(d), callback_data=callback_data))
+        row.append(
+            InlineKeyboardButton(
+                text=str(d), callback_data=f"day_{year}_{month}_{d}"
+            )
+        )
         if len(row) == 7:
             kb.row(*row)
             row = []
