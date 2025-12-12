@@ -2072,8 +2072,8 @@ def available_minutes(
     if hour < 9 or hour > 16:
         return []
 
-    # Години роботи: 09:00–16:00, остання година без хвилинної градації
-    minutes = [0] if hour == 16 else list(range(0, 60, 5))
+    # Години роботи: 09:00–16:00 з кроком 30 хвилин (00 та 30)
+    minutes = [0, 30]
 
     if earliest_dt and selected_date == earliest_dt.date():
         if hour < earliest_dt.hour:
