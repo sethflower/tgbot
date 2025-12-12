@@ -1461,7 +1461,7 @@ async def render_slots_overview(target_date: date) -> str:
 
     lines = [
         f"<b>📅 Слоти на {target_date.strftime('%d.%m.%Y')}</b>",
-        "Слоти 09:00–16:00 з кроком 5 хвилин:",
+        "Слоти 09:00–16:00 з кроком 30 хвилин:",
         "",
     ]
 
@@ -2114,7 +2114,7 @@ def available_hours(
 def all_slots_for_day(selected_date: date) -> list[str]:
     slots: list[str] = []
     for hour in range(9, 17):
-        minutes = [0] if hour == 16 else list(range(0, 60, 5))
+        minutes = [0, 30]
         for minute in minutes:
             slots.append(f"{hour:02d}:{minute:02d}")
     return slots
