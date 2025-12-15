@@ -2804,13 +2804,14 @@ async def _auto_close_tick():
             approved_at = req.updated_at or req.created_at
             if not approved_at:
                 continue
-            
+
             if approved_at.tzinfo is None:
                 approved_at = approved_at.replace(tzinfo=KYIV_TZ)
 
             close_after = approved_at + timedelta(hours=20)
 
         if now >= close_after:
+            await complete_request(req.id, auto=True)
             
 ###############################################################
 #                         BOT STARTUP                         
