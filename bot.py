@@ -1480,7 +1480,7 @@ async def admin_all(callback: types.CallbackQuery):
     text = "<b>📚 Останні 20 заявок</b>\nШвидка навігація по архіву:\n\n"
     kb = InlineKeyboardBuilder()
     for r in rows:
-        status = "🟢 NEW" if r.status == "new" else f"⚪ {get_status_label(r.status)}"
+        status = get_status_label(r.status)
         text += (
             f"• <b>#{r.id}</b>  "
             f"{r.supplier}  —  {r.date.strftime('%d.%m.%Y')} {r.time}  —  {status}\n"
@@ -1488,7 +1488,7 @@ async def admin_all(callback: types.CallbackQuery):
         kb.button(
             text=(
                 f"#{r.id} — {r.supplier} — "
-                f"{r.date.strftime('%d.%m.%Y')} {r.time} ({r.status})"
+                f"{r.date.strftime('%d.%m.%Y')} {r.time} ({status})"
             ),
             callback_data=f"admin_view_{r.id}"
         )
