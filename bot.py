@@ -147,6 +147,7 @@ class Request(Base):
     driver_name = Column(Text)
     phone = Column(Text)
     car = Column(Text)
+    cargo_description = Column(Text)
 
     docs_file_id = Column(Text, nullable=True)
     cargo_type = Column(Text)
@@ -189,6 +190,8 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE requests ADD COLUMN updated_at TIMESTAMP"))
             if "completed_at" not in cols:
                 sync_conn.execute(text("ALTER TABLE requests ADD COLUMN completed_at TIMESTAMP"))
+            if "cargo_description" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN cargo_description TEXT"))
 
             # backfill plan and timestamps for existing rows
             sync_conn.execute(text("UPDATE requests SET planned_date = date WHERE planned_date IS NULL"))
@@ -287,13 +290,14 @@ class GoogleSheetClient:
             admin_name if admin_decision and admin_name else "",
             req.completed_at.strftime("%d.%m.%Y %H:%M") if req.completed_at else "",
             str(req.id),
+            req.cargo_description or "",
         ]
 
     async def _update_row(self, row_number: int, values: list[str]) -> bool:
         try:
             await asyncio.to_thread(
                 self._worksheet.update,
-                f"A{row_number}:O{row_number}",
+                f"A{row_number}:P{row_number}",
                 [values],
                 value_input_option="USER_ENTERED",
             )
@@ -368,7 +372,7 @@ class GoogleSheetClient:
             return
 
         try:
-            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:O"])
+            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:P"])
         except Exception as exc:
             logging.exception("Не вдалося очистити таблицю Sheets: %s", exc)
 
@@ -481,6 +485,7 @@ class QueueForm(StatesGroup):
     supplier = State()
     phone = State()
     car = State()
+    cargo_description = State()
     loading_type = State()
     calendar = State()
     hour = State()
@@ -514,6 +519,7 @@ class UserEditForm(StatesGroup):
     supplier = State()
     phone = State()
     car = State()
+    cargo_description = State()
     loading_type = State()
     calendar = State()     # выбор даты
     new_date = State()     # подтверждение даты
@@ -626,6 +632,7 @@ def format_request_text(req: Request) -> str:
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
         f"📞 <b>Контакт:</b> {req.phone}\n"
         f"🚚 <b>Авто:</b> {req.car}\n"
+        f"📦 <b>Товар:</b> {req.cargo_description or ''}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>План:</b> {planned_date} {planned_time}\n"
         f"✅ <b>Підтверджено:</b> {req.date.strftime('%d.%m.%Y')} {req.time}\n"
@@ -857,6 +864,7 @@ def build_user_edit_choice_keyboard():
     kb.button(text="🏢 Постачальник", callback_data="edit_field_supplier")
     kb.button(text="📞 Телефон", callback_data="edit_field_phone")
     kb.button(text="🚚 Авто", callback_data="edit_field_car")
+    kb.button(text="📦 Товар", callback_data="edit_field_cargo_description")
     kb.button(text="🧱 Тип завантаження", callback_data="edit_field_loading")
     kb.button(text="📅 Дата та час", callback_data="edit_field_datetime")
     kb.adjust(1)
@@ -1016,6 +1024,35 @@ async def user_edit_car(message: types.Message, state: FSMContext):
     )
 
 
+@dp.message(UserEditForm.cargo_description)
+async def user_edit_cargo_description(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(UserEditForm.field_choice)
+        return await message.answer(
+            "Оберіть, що потрібно змінити у заявці:",
+            reply_markup=build_user_edit_choice_keyboard(),
+        )
+
+    value = message.text.strip()
+    if not value:
+        return await message.answer("Значення не може бути порожнім.")
+
+    req, reason = await _load_request_for_edit(state, message.from_user.id)
+    if not req:
+        return await message.answer("Заявка не знайдена або вам не належить.")
+
+    old_value = req.cargo_description
+    req.cargo_description = value
+    await finalize_user_edit_update(
+        message,
+        state,
+        req,
+        reason or "",
+        text=f"Поле 'Товар' оновлено для заявки #{req.id}.",
+        changes=[("Товар", old_value, req.cargo_description)],
+    )
+
+
 @dp.callback_query(UserEditForm.loading_type, F.data == "edit_back_to_choice")
 async def user_edit_loading_back(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(UserEditForm.field_choice)
@@ -1067,6 +1104,10 @@ async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContex
         "supplier": (UserEditForm.supplier, "Введіть нову назву постачальника:"),
         "phone": (UserEditForm.phone, "Введіть новий номер телефону:"),
         "car": (UserEditForm.car, "Введіть нову марку і номер авто:"),
+        "cargo_description": (
+            UserEditForm.cargo_description,
+            "Опишіть товар, який доставляється:",
+        ),
     }
 
     if choice in prompts:
@@ -1876,7 +1917,7 @@ async def step_supplier(message: types.Message, state: FSMContext):
     await state.update_data(supplier=supplier)
 
     await message.answer(
-        "📞 <b>Крок 2/5</b>\nЗалиште контактний номер телефону:",
+        "📞 <b>Крок 2/6</b>\nЗалиште контактний номер телефону:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.phone)
@@ -1887,7 +1928,7 @@ async def step_phone(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.supplier)
         return await message.answer(
-            "🏢 <b>Крок 1/5</b>\nВкажіть назву постачальника:",
+            "🏢 <b>Крок 1/6</b>\nВкажіть назву постачальника:",
             reply_markup=navigation_keyboard(include_back=False)
         )
 
@@ -1898,7 +1939,7 @@ async def step_phone(message: types.Message, state: FSMContext):
     await state.update_data(phone=phone)
 
     await message.answer(
-        "🚚 <b>Крок 3/5</b>\nВведіть марку та номер авто:",
+        "🚚 <b>Крок 3/6</b>\nВведіть марку та номер авто:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.car)
@@ -1909,7 +1950,7 @@ async def step_car(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.phone)
         return await message.answer(
-            "📞 <b>Крок 2/5</b>\nЗалиште контактний номер телефону:",
+            "📞 <b>Крок 2/6</b>\nЗалиште контактний номер телефону:",
             reply_markup=navigation_keyboard(),
         )
 
@@ -1919,24 +1960,47 @@ async def step_car(message: types.Message, state: FSMContext):
 
     await state.update_data(car=car)
 
+    await message.answer(
+        "📦 <b>Крок 4/6</b>\nВкажіть товар, який доставляється:",
+        reply_markup=navigation_keyboard(),
+    )
+
+    await state.set_state(QueueForm.cargo_description)
+
+
+@dp.message(QueueForm.cargo_description)
+async def step_cargo_description(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(QueueForm.car)
+        return await message.answer(
+            "🚚 <b>Крок 3/6</b>\nВведіть марку та номер авто:",
+            reply_markup=navigation_keyboard(),
+        )
+
+    cargo_description = message.text.strip()
+    if not cargo_description:
+        return await message.answer("⚠️ Опишіть товар, який доставляється.")
+
+    await state.update_data(cargo_description=cargo_description)
+
     kb = InlineKeyboardBuilder()
     kb.button(text="🚚 На палетах", callback_data="type_pal")
     kb.button(text="📦 В розсип", callback_data="type_loose")
     kb.adjust(1)
 
     await message.answer(
-        "⚙️ <b>Крок 4/5</b>\nОберіть тип завантаження:",
-        reply_markup=add_inline_navigation(kb, back_callback="back_to_car").as_markup(),
+        "⚙️ <b>Крок 5/6</b>\nОберіть тип завантаження:",
+        reply_markup=add_inline_navigation(kb, back_callback="back_to_cargo").as_markup(),
     )
 
     await state.set_state(QueueForm.loading_type)
 
 
-@dp.callback_query(QueueForm.loading_type, F.data == "back_to_car")
+@dp.callback_query(QueueForm.loading_type, F.data == "back_to_cargo")
 async def loading_back(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(QueueForm.car)
+    await state.set_state(QueueForm.cargo_description)
     await callback.message.answer(
-        "🚚 <b>Крок 3/5</b>\nВведіть марку та номер авто:",
+        "📦 <b>Крок 4/6</b>\nВкажіть товар, який доставляється:",
         reply_markup=navigation_keyboard(),
     )
     await callback.answer()
@@ -1958,7 +2022,7 @@ async def step_loading(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(loading_type=t, min_plan_dt=min_dt.isoformat())
 
     await callback.message.answer(
-        "📅 <b>Крок 5/5</b>\nОберіть дату та час візиту:",
+        "📅 <b>Крок 6/6</b>\nОберіть дату та час візиту:",
         reply_markup=build_date_calendar(
             back_callback="back_to_loading", hide_sundays=True, min_date=min_dt.date()
         )
@@ -2241,7 +2305,7 @@ async def back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
 
     await state.set_state(QueueForm.calendar)
     await callback.message.answer(
-        "📅 <b>Крок 5/5</b>\nОберіть дату та час візиту:", reply_markup=markup
+        "📅 <b>Крок 6/6</b>\nОберіть дату та час візиту:", reply_markup=markup
     )
     await callback.answer()
 
@@ -2311,6 +2375,7 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
             supplier=data["supplier"],
             phone=data["phone"],
             car=data["car"],
+            cargo_description=data["cargo_description"],
             loading_type=data["loading_type"],
             planned_date=chosen_date,
             planned_time=f"{int(chosen_hour):02d}:{int(minute):02d}",
@@ -2375,6 +2440,7 @@ async def broadcast_new_request(req_id: int):
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
         f"📞 <b>Контакт:</b> {req.phone}\n"
         f"🚚 <b>Авто:</b> {req.car}\n"
+        f"📦 <b>Товар:</b> {req.cargo_description or ''}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>План:</b> {req.planned_date.strftime('%d.%m.%Y')}\n"
         f"⏰ <b>Час:</b> {req.planned_time}\n"
