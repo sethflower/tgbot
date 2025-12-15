@@ -2797,15 +2797,23 @@ async def _auto_close_tick():
         requests = res.scalars().all()
 
     for req in requests:
-        approved_at = req.updated_at or req.created_at
-        if not approved_at:
-            continue
+        confirmed_dt = get_confirmed_datetime(req)
+        if confirmed_dt:
+            close_after = confirmed_dt + timedelta(hours=20)
+        else:
+            approved_at = req.updated_at or req.created_at
+            if not approved_at:
+                continue
 
         if approved_at.tzinfo is None:
             approved_at = approved_at.replace(tzinfo=KYIV_TZ)
             
-        if now >= approved_at + timedelta(hours=20):
-            await complete_request(req.id, auto=True)
+        if approved_at.tzinfo is None:
+                approved_at = approved_at.replace(tzinfo=KYIV_TZ)
+
+            close_after = approved_at + timedelta(hours=20)
+
+        if now >= close_after:
             
 ###############################################################
 #                         BOT STARTUP                         
