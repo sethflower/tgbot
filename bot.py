@@ -405,6 +405,7 @@ def add_inline_navigation(builder: InlineKeyboardBuilder, back_callback: str | N
 
 async def show_main_menu(message: types.Message, state: FSMContext):
     await state.clear()
+    show_admin = await is_admin_user(message.from_user.id)
     await message.answer(
         "<b>🏠 DC Link черга | Головне меню</b>\n"
         "Оберіть, що зробити просто зараз:",
@@ -412,7 +413,7 @@ async def show_main_menu(message: types.Message, state: FSMContext):
     )
     await message.answer(
         "📍 Керування доступними розділами:",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(show_admin=show_admin),
     )
 
 
@@ -425,11 +426,23 @@ async def handle_main_menu_callback(callback: types.CallbackQuery, state: FSMCon
     await show_main_menu(callback.message, state)
     await callback.answer()
 
-def main_menu():
+async def is_admin_user(user_id: int) -> bool:
+    if user_id == SUPERADMIN_ID:
+        return True
+
+    async with SessionLocal() as session:
+        res = await session.execute(select(Admin).where(Admin.telegram_id == user_id))
+        admin = res.scalar_one_or_none()
+
+    return bool(admin)
+
+
+def main_menu(show_admin: bool = False):
     kb = InlineKeyboardBuilder()
     kb.button(text="📝 Нова заявка", callback_data="menu_new")
     kb.button(text="📂 Мої останні заявки", callback_data="menu_my")
-    kb.button(text="🛠 Адмін-панель", callback_data="menu_admin")
+    if show_admin:
+        kb.button(text="🛠 Адмін-панель", callback_data="menu_admin")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -539,6 +552,7 @@ class UserEditForm(StatesGroup):
 @dp.message(CommandStart())
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
+    show_admin = await is_admin_user(message.from_user.id)
 
     hero = (
         "<b>🚀 DC Link | Електронна черга постачальників</b>\n"
@@ -550,7 +564,8 @@ async def start(message: types.Message, state: FSMContext):
 
     await message.answer(hero, reply_markup=navigation_keyboard(include_back=False))
     await message.answer(
-        "Готові працювати? Оберіть розділ нижче:", reply_markup=main_menu()
+        "Готові працювати? Оберіть розділ нижче:",
+        reply_markup=main_menu(show_admin=show_admin),
     )
 
 
@@ -1468,10 +1483,13 @@ async def admin_all(callback: types.CallbackQuery):
         status = "🟢 NEW" if r.status == "new" else f"⚪ {get_status_label(r.status)}"
         text += (
             f"• <b>#{r.id}</b>  "
-            f"{r.date.strftime('%d.%m.%Y')} {r.time}  —  {status}\n"
+            f"{r.supplier}  —  {r.date.strftime('%d.%m.%Y')} {r.time}  —  {status}\n"
         )
         kb.button(
-            text=f"#{r.id} — {r.date.strftime('%d.%m.%Y')} {r.time} ({r.status})",
+            text=(
+                f"#{r.id} — {r.supplier} — "
+                f"{r.date.strftime('%d.%m.%Y')} {r.time} ({r.status})"
+            ),
             callback_data=f"admin_view_{r.id}"
         )
 
@@ -1589,6 +1607,7 @@ def build_admin_request_view(req: Request, is_superadmin: bool):
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
         f"📞 <b>Телефон:</b> {req.phone}\n"
         f"🚚 <b>Авто:</b> {req.car}\n"
+        f"📦 <b>Товар:</b> {req.cargo_description or ''}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>План:</b> {plan_date} {plan_time}\n"
         f"✅ <b>Підтверджено:</b> {req.date.strftime('%d.%m.%Y')} {req.time}\n"
