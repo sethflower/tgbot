@@ -732,7 +732,7 @@ def format_request_text(req: Request) -> str:
         "━━━━━━━━━━━━━━━━\n"
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
         f"📞 <b>Контакт:</b> {req.phone}\n"
-        f"🚚 <b>Авто:</b> {req.car}\n"
+        f"🚚 <b>Об'єм:</b> {req.car}\n"
         f"📦 <b>Товар:</b> {req.cargo_description or ''}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>План:</b> {planned_date} {planned_time}\n"
@@ -964,7 +964,7 @@ def build_user_edit_choice_keyboard():
     kb = InlineKeyboardBuilder()
     kb.button(text="🏢 Постачальник", callback_data="edit_field_supplier")
     kb.button(text="📞 Телефон", callback_data="edit_field_phone")
-    kb.button(text="🚚 Авто", callback_data="edit_field_car")
+    kb.button(text="🚚 Об'єм", callback_data="edit_field_car")
     kb.button(text="📦 Товар", callback_data="edit_field_cargo_description")
     kb.button(text="🧱 Тип завантаження", callback_data="edit_field_loading")
     kb.button(text="📅 Дата та час", callback_data="edit_field_datetime")
@@ -1120,8 +1120,8 @@ async def user_edit_car(message: types.Message, state: FSMContext):
         state,
         req,
         reason or "",
-        text=f"Поле 'Авто' оновлено для заявки #{req.id}.",
-        changes=[("Авто", old_value, req.car)],
+        text=f"Поле 'Об'єм' оновлено для заявки #{req.id}.",
+        changes=[("Об'єм", old_value, req.car)],
     )
 
 
@@ -1204,7 +1204,7 @@ async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContex
     prompts = {
         "supplier": (UserEditForm.supplier, "Введіть нову назву постачальника:"),
         "phone": (UserEditForm.phone, "Введіть новий номер телефону:"),
-        "car": (UserEditForm.car, "Введіть нову марку і номер авто:"),
+        "car": (UserEditForm.car, "Введіть новий об'єм вантажу:"),
         "cargo_description": (
             UserEditForm.cargo_description,
             "Опишіть товар, який доставляється:",
@@ -1692,7 +1692,7 @@ def build_admin_request_view(req: Request, is_superadmin: bool):
         f"Статус: {status}\n\n"
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
         f"📞 <b>Телефон:</b> {req.phone}\n"
-        f"🚚 <b>Авто:</b> {req.car}\n"
+        f"🚚 <b>Об'єм:</b> {req.car}\n"
         f"📦 <b>Товар:</b> {req.cargo_description or ''}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>План:</b> {plan_date} {plan_time}\n"
@@ -2097,7 +2097,7 @@ async def step_phone(message: types.Message, state: FSMContext):
     await state.update_data(phone=phone)
 
     await message.answer(
-        "🚚 <b>Крок 3/6</b>\nВведіть марку та номер авто:",
+        "🚚 <b>Крок 3/6</b>\nВкажіть об'єм вантажу:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.car)
@@ -2114,7 +2114,7 @@ async def step_car(message: types.Message, state: FSMContext):
 
     car = message.text.strip()
     if not car:
-        return await message.answer("⚠️ Вкажіть марку та номер авто.")
+        return await message.answer("⚠️ Вкажіть об'єм вантажу.")
 
     await state.update_data(car=car)
 
@@ -2131,7 +2131,7 @@ async def step_cargo_description(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.car)
         return await message.answer(
-            "🚚 <b>Крок 3/6</b>\nВведіть марку та номер авто:",
+            "🚚 <b>Крок 3/6</b>\nВкажіть об'єм вантажу:",
             reply_markup=navigation_keyboard(),
         )
 
@@ -2597,7 +2597,7 @@ async def broadcast_new_request(req_id: int):
         "━━━━━━━━━━━━━━━━\n"
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
         f"📞 <b>Контакт:</b> {req.phone}\n"
-        f"🚚 <b>Авто:</b> {req.car}\n"
+        f"🚚 <b>Об'єм:</b> {req.car}\n"
         f"📦 <b>Товар:</b> {req.cargo_description or ''}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>План:</b> {req.planned_date.strftime('%d.%m.%Y')}\n"
