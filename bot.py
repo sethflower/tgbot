@@ -231,6 +231,8 @@ def get_sheet_status(status: str) -> str:
 class GoogleSheetClient:
     def __init__(self):
         self._worksheet = None
+        self._spreadsheet = None
+        self._np_worksheet = None
         self._init_attempted = False
 
     async def _ensure_client(self) -> bool:
@@ -253,15 +255,39 @@ class GoogleSheetClient:
 
             def _init_ws():
                 client = gspread.authorize(creds)
-                return client.open_by_key(GOOGLE_SPREADSHEET_ID).sheet1
+                spreadsheet = client.open_by_key(GOOGLE_SPREADSHEET_ID)
+                return spreadsheet, spreadsheet.sheet1
 
-            self._worksheet = await asyncio.to_thread(_init_ws)
+            self._spreadsheet, self._worksheet = await asyncio.to_thread(_init_ws)
             logging.info("Google Sheets клієнт ініціалізовано")
         except Exception as exc:
             logging.exception("Не вдалося підключитися до Google Sheets: %s", exc)
             self._worksheet = None
 
         return self._worksheet is not None
+
+    async def _get_np_worksheet(self):
+        if not await self._ensure_client():
+            return None
+
+        if self._np_worksheet:
+            return self._np_worksheet
+
+        def _fetch_ws():
+            try:
+                return self._spreadsheet.worksheet("Накопитель НП")
+            except gspread.WorksheetNotFound:
+                return self._spreadsheet.add_worksheet(
+                    title="Накопитель НП", rows=1000, cols=3
+                )
+
+        try:
+            self._np_worksheet = await asyncio.to_thread(_fetch_ws)
+        except Exception as exc:
+            logging.exception("Не вдалося отримати аркуш 'Накопитель НП': %s", exc)
+            self._np_worksheet = None
+
+        return self._np_worksheet
 
     def _build_row(self, req: Request, admin_name: str) -> list[str]:
         admin_decision = req.status in {"approved", "rejected"}
@@ -330,6 +356,29 @@ class GoogleSheetClient:
         except Exception as exc:
             logging.exception("Не вдалося додати рядок у Sheets: %s", exc)
             return None
+
+    async def append_np_delivery(self, supplier: str, ttn: str) -> bool:
+        ws = await self._get_np_worksheet()
+        if not ws:
+            return False
+
+        values = [
+            kyiv_now().strftime("%d.%m.%Y %H:%M"),
+            supplier,
+            ttn,
+        ]
+
+        try:
+            await asyncio.to_thread(
+                ws.append_row,
+                values,
+                value_input_option="USER_ENTERED",
+                table_range="A2",
+            )
+            return True
+        except Exception as exc:
+            logging.exception("Не вдалося додати заявку НП у Sheets: %s", exc)
+            return False
 
     async def _store_row_number(self, req_id: int, row_number: int):
         async with SessionLocal() as session:
@@ -446,6 +495,20 @@ def main_menu(show_admin: bool = False):
     kb.adjust(1)
     return kb.as_markup()
 
+def delivery_type_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🚚 Доставка постачальником", callback_data="delivery_supplier")
+    kb.button(text="📦 Доставка Новою поштою", callback_data="delivery_np")
+    kb.adjust(1)
+    return add_inline_navigation(kb).as_markup()
+
+async def prompt_delivery_type(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "📦 Оберіть тип доставки для нової заявки:",
+        reply_markup=delivery_type_keyboard(),
+    )
+
 def admin_menu(is_superadmin: bool = False):
     kb = InlineKeyboardBuilder()
     kb.button(text="🆕 Нові заявки", callback_data="admin_new")
@@ -541,6 +604,10 @@ class UserEditForm(StatesGroup):
     new_time = State()     # подтверждение времени
     reason = State()       # причина изменения
 
+class NPDeliveryForm(StatesGroup):
+    supplier = State()
+    ttn = State()
+
 
 
 
@@ -575,6 +642,12 @@ async def start(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "menu_new")
 async def menu_new(callback: types.CallbackQuery, state: FSMContext):
+    await prompt_delivery_type(callback.message, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "delivery_supplier")
+async def delivery_supplier(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
 
     await callback.message.answer(
@@ -583,6 +656,19 @@ async def menu_new(callback: types.CallbackQuery, state: FSMContext):
     )
 
     await state.set_state(QueueForm.supplier)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "delivery_np")
+async def delivery_np(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(NPDeliveryForm.supplier)
+
+    await callback.message.answer(
+        "✉️ Введіть назву постачальника для доставки Новою поштою:",
+        reply_markup=navigation_keyboard()
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "menu_my")
@@ -1916,6 +2002,59 @@ async def admin_clear_yes(callback: types.CallbackQuery):
 async def admin_clear_no(callback: types.CallbackQuery):
     await callback.message.answer("Операцію скасовано.")
 
+###############################################################
+#               NOVA POSHTA DELIVERY (SIMPLE FORM)
+###############################################################
+
+@dp.message(NPDeliveryForm.supplier)
+async def np_supplier_step(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        return await prompt_delivery_type(message, state)
+
+    supplier = message.text.strip()
+    if not supplier:
+        return await message.answer("⚠️ Вкажіть назву постачальника, щоб продовжити.")
+
+    await state.update_data(supplier=supplier)
+    await state.set_state(NPDeliveryForm.ttn)
+    await message.answer(
+        "✉️ Введіть номер ТТН Нової пошти:",
+        reply_markup=navigation_keyboard(),
+    )
+
+
+@dp.message(NPDeliveryForm.ttn)
+async def np_ttn_step(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(NPDeliveryForm.supplier)
+        return await message.answer(
+            "✉️ Введіть назву постачальника для доставки Новою поштою:",
+            reply_markup=navigation_keyboard(),
+        )
+
+    ttn = message.text.strip()
+    if not ttn:
+        return await message.answer("⚠️ Введіть номер ТТН, щоб завершити заявку.")
+
+    data = await state.get_data()
+    supplier = data.get("supplier", "")
+
+    saved = await sheet_client.append_np_delivery(supplier, ttn)
+    await notify_admins_np_delivery(supplier, ttn)
+
+    if saved:
+        await message.answer(
+            "✅ Заявка на доставку Новою поштою зафіксована. Адміністратори отримали повідомлення.",
+            reply_markup=navigation_keyboard(include_back=False),
+        )
+    else:
+        await message.answer(
+            "⚠️ Адміністратори сповіщені, але не вдалося записати заявку у Google Sheets.",
+            reply_markup=navigation_keyboard(include_back=False),
+        )
+
+    await state.clear()
+
 
 ###############################################################
 #               DRIVER FORM — INPUT STEPS                     
@@ -2798,6 +2937,22 @@ async def notify_admins_about_action(req: Request, action: str):
     for a in admins:
         try:
             await bot.send_message(a.telegram_id, text)
+        except:
+            pass
+
+async def notify_admins_np_delivery(supplier: str, ttn: str):
+    async with SessionLocal() as session:
+        admins = (await session.execute(select(Admin))).scalars().all()
+
+    text = (
+        "📦 <b>НП-відправка</b>\n"
+        f"Постачальник <b>{supplier}</b> відправив посилку № {ttn}.\n"
+        "Підтвердження не потрібне, це повідомлення лише для інформації."
+    )
+
+    for admin in admins:
+        try:
+            await bot.send_message(admin.telegram_id, text)
         except:
             pass
 
