@@ -581,6 +581,10 @@ class AdminChangeForm(StatesGroup):
     calendar = State()
     hour = State()
     minute = State()
+    reason = State()
+
+class AdminRejectForm(StatesGroup):
+    reason = State()
 
 class AdminPlanView(StatesGroup):
     calendar = State()
@@ -2646,26 +2650,49 @@ async def adm_ok(callback: types.CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("adm_rej_"))
-async def adm_rej(callback: types.CallbackQuery):
+async def adm_rej(callback: types.CallbackQuery, state: FSMContext):
     req_id = int(callback.data.split("_")[2])
+
+    await callback.message.answer(
+        f"✏️ Вкажіть причину відхилення заявки #{req_id}:",
+    )
+    await callback.answer()
+    await state.set_state(AdminRejectForm.reason)
+    await state.update_data(req_id=req_id)
+
+
+@dp.message(AdminRejectForm.reason)
+async def adm_rej_reason(message: types.Message, state: FSMContext):
+    reason = (message.text or "").strip()
+    if not reason:
+        return await message.answer("Будь ласка, вкажіть причину відхилення.")
+
+    data = await state.get_data()
+    req_id = data.get("req_id")
 
     async with SessionLocal() as session:
         req = await session.get(Request, req_id)
+        if not req:
+            await state.clear()
+            return await message.answer("Заявку не знайдено.")
+
         req.status = "rejected"
-        req.admin_id = callback.from_user.id
+        req.admin_id = message.from_user.id
         set_updated_now(req)
         await session.commit()
 
-    await callback.message.answer("❌ Відхилено!")
+    await message.answer("❌ Заявку відхилено.")
 
     await sheet_client.sync_request(req)
 
     await bot.send_message(
         req.user_id,
-        f"❌ <b>Заявку #{req.id} відхилено адміністратором.</b>"
+        f"❌ <b>Заявку #{req.id} відхилено адміністратором.</b>\n"
+        f"Причина: {reason}"
     )
 
-    await notify_admins_about_action(req, "відхилена")
+    await notify_admins_about_action(req, "відхилена", reason=reason)
+    await state.clear()
 
 
 @dp.callback_query(F.data.startswith("adm_finish_"))
@@ -2889,17 +2916,40 @@ async def adm_min(callback: types.CallbackQuery, state: FSMContext):
         return await callback.answer("Цей час вже недоступний", show_alert=True)
 
     new_time = f"{int(new_hour):02d}:{int(minute):02d}"
+    await state.update_data(new_time=new_time)
+    await state.set_state(AdminChangeForm.reason)
+
+    await callback.message.answer(
+        f"✏️ Вкажіть причину зміни дати/часу для заявки #{req_id}:",
+    )
+    await callback.answer()
+
+
+@dp.message(AdminChangeForm.reason)
+async def adm_change_reason(message: types.Message, state: FSMContext):
+    reason = (message.text or "").strip()
+    if not reason:
+        return await message.answer("Будь ласка, вкажіть причину зміни дати або часу.")
+
+    data = await state.get_data()
+    req_id = data.get("req_id")
+    new_date: date | None = data.get("new_date")
+    new_time: str | None = data.get("new_time")
 
     async with SessionLocal() as session:
         req = await session.get(Request, req_id)
+        if not req or not new_date or not new_time:
+            await state.clear()
+            return await message.answer("Не вдалося змінити дату/час.")
+
         req.date = new_date
         req.time = new_time
         req.status = "approved"
-        req.admin_id = callback.from_user.id
+        req.admin_id = message.from_user.id
         set_updated_now(req)
         await session.commit()
 
-    await callback.message.answer("🔁 Дата/час успішно змінені!")
+    await message.answer("🔁 Дата/час успішно змінені!")
 
     await sheet_client.sync_request(req)
 
@@ -2907,11 +2957,12 @@ async def adm_min(callback: types.CallbackQuery, state: FSMContext):
     await bot.send_message(
         req.user_id,
         f"🔄 <b>Час вашої заявки #{req.id} змінено:</b>\n"
-        f"📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}"
+        f"📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}\n"
+        f"Причина: {reason}"
     )
 
     # Уведомить всех админов
-    await notify_admins_about_action(req, "змінена (дата/час)")
+    await notify_admins_about_action(req, "змінена (дата/час)", reason=reason)
 
     await state.clear()
 
@@ -2920,7 +2971,7 @@ async def adm_min(callback: types.CallbackQuery, state: FSMContext):
 #        BROADCAST ACTION TO ALL ADMINS (Uniﬁed Function)     
 ###############################################################
 
-async def notify_admins_about_action(req: Request, action: str):
+async def notify_admins_about_action(req: Request, action: str, *, reason: str | None = None):
     async with SessionLocal() as session:
         admins = (await session.execute(select(Admin))).scalars().all()
 
@@ -2933,6 +2984,8 @@ async def notify_admins_about_action(req: Request, action: str):
         f"🧱 {req.loading_type}\n"
         f"🏁 {final_status}"
     )
+    if reason:
+        text += f"\n\nПричина: {reason}"
 
     for a in admins:
         try:
