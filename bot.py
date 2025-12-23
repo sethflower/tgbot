@@ -104,19 +104,96 @@ def parse_date_input(raw: str) -> date | None:
         return None
 
 
+ROLE_LABELS = {
+    "user": "Користувач",
+    "admin": "Адміністратор",
+    "superadmin": "Суперадмін",
+    "system": "Система",
+}
+
+ACTION_LABELS = {
+    "request_created": "Створення нової заявки",
+    "request_updated": "Зміна заявки користувачем",
+    "request_deleted": "Видалення заявки користувачем",
+    "request_deleted_by_admin": "Видалення заявки адміністратором",
+    "request_approved": "Підтвердження заявки адміністратором",
+    "request_rejected": "Відхилення заявки адміністратором",
+    "request_completed": "Завершення заявки",
+    "logs_export": "Експорт журналу дій",
+    "admin_added": "Додано нового адміністратора",
+    "admin_removed": "Видалено адміністратора",
+    "database_cleared": "Очищено всі заявки",
+    "np_delivery_submitted": "Заявка на доставку Новою поштою",
+    "admin_change_time": "Адміністратор запропонував новий час",
+    "admin_change_confirmed": "Користувач підтвердив час адміністратора",
+    "admin_change_delete": "Користувач скасував заявку після зміни",
+    "admin_change_declined": "Користувач відмовився від часу адміністратора",
+    "admin_change_proposed": "Користувач запропонував інший час",
+    "admin_keep_client_time": "Адміністратор залишив час користувача",
+    "admin_keep_admin_time": "Адміністратор залишив свій час",
+    "admin_accept_user_proposal": "Адміністратор прийняв пропозицію користувача",
+    "admin_reject_user_proposal": "Адміністратор відхилив пропозицію користувача",
+}
+
+DETAIL_KEY_LABELS = {
+    "request_id": "ID заявки",
+    "reason": "Причина",
+    "changes": "Зміни",
+    "field": "Поле",
+    "old": "Було",
+    "new": "Стало",
+    "start": "Початок періоду",
+    "end": "Кінець періоду",
+    "telegram_id": "Telegram ID",
+    "last_name": "Прізвище",
+    "name": "Ім'я/Прізвище",
+    "new_date": "Нова дата",
+    "new_time": "Новий час",
+    "date": "Дата",
+    "time": "Час",
+    "planned_date": "Запланована дата",
+    "planned_time": "Запланований час",
+    "proposed_date": "Запропонована дата",
+    "proposed_time": "Запропонований час",
+    "supplier": "Постачальник",
+    "auto": "Автоматичне закриття",
+    "saved_to_sheet": "Запис у Google Sheets",
+    "ttn": "ТТН",
+}
+
+
+def _localize_detail_key(key: str) -> str:
+    return DETAIL_KEY_LABELS.get(key, key)
+
+
+def _localize_detail_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return "так" if value else "ні"
+    if isinstance(value, (datetime, date, dtime)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {_localize_detail_key(k): _localize_detail_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_localize_detail_value(v) for v in value]
+    return value
+
+
 async def log_action(
     actor_id: int | None,
     actor_role: str,
     action: str,
     details: dict[str, Any] | None = None,
 ):
-    payload = json.dumps(details, ensure_ascii=False) if details else None
+    role_label = ROLE_LABELS.get(actor_role, actor_role or "Невідомо")
+    action_label = ACTION_LABELS.get(action, action)
+    localized_details = _localize_detail_value(details) if details else None
+    payload = json.dumps(localized_details, ensure_ascii=False) if localized_details else None
     async with SessionLocal() as session:
         session.add(
             ActionLog(
                 actor_id=actor_id,
-                actor_role=actor_role,
-                action=action,
+                actor_role=role_label,
+                action=action_label,
                 details=payload,
                 created_at=kyiv_now_naive(),
             )
