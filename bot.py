@@ -138,6 +138,7 @@ ACTION_LABELS = {
 DETAIL_KEY_LABELS = {
     "request_id": "ID заявки",
     "reason": "Причина",
+    "description": "Опис",
     "changes": "Зміни",
     "field": "Поле",
     "old": "Було",
@@ -178,6 +179,59 @@ def _localize_detail_value(value: Any) -> Any:
     return value
 
 
+def build_action_description(action: str, role_label: str, details: dict[str, Any] | None) -> str:
+    d = details or {}
+    rid = d.get("request_id")
+    reason = d.get("reason")
+    date_val = d.get("date") or d.get("new_date") or d.get("planned_date") or d.get("proposed_date")
+    time_val = d.get("time") or d.get("new_time") or d.get("planned_time") or d.get("proposed_time")
+
+    if action == "request_created":
+        return f"{role_label} створив(ла) нову заявку #{rid} на {d.get('supplier', '')} ({date_val} {time_val}).".strip()
+    if action == "request_updated":
+        return f"{role_label} оновив(ла) заявку #{rid}. Причина: {reason or 'не вказано'}."
+    if action == "request_deleted":
+        return f"{role_label} видалив(ла) свою заявку #{rid}. Причина: {reason or 'не вказано'}."
+    if action == "request_deleted_by_admin":
+        return f"{role_label} видалив(ла) заявку користувача #{rid}."
+    if action == "request_approved":
+        return f"{role_label} підтвердив(ла) заявку #{rid}."
+    if action == "request_rejected":
+        return f"{role_label} відхилив(ла) заявку #{rid}. Причина: {reason or 'не вказано'}."
+    if action == "request_completed":
+        return f"{role_label} завершив(ла) заявку #{rid} ({'авто' if d.get('auto') else 'ручне'} закриття)."
+    if action == "logs_export":
+        return f"{role_label} експортував(ла) журнал дій за період {d.get('start')} — {d.get('end')}."
+    if action == "admin_added":
+        return f"{role_label} додав(ла) адміністратора Telegram ID {d.get('telegram_id')} ({d.get('last_name', '')})."
+    if action == "admin_removed":
+        return f"{role_label} видалив(ла) адміністратора Telegram ID {d.get('telegram_id')}."
+    if action == "database_cleared":
+        return f"{role_label} повністю очистив(ла) базу заявок."
+    if action == "np_delivery_submitted":
+        return f"{role_label} подав(ла) заявку НП: постачальник {d.get('supplier', '')}, ТТН {d.get('ttn', '')}."
+    if action == "admin_change_time":
+        return f"{role_label} запропонував(ла) новий час для заявки #{rid}: {date_val} {time_val}. Причина: {reason or 'не вказано'}."
+    if action == "admin_change_confirmed":
+        return f"{role_label} підтвердив(ла) час адміністратора для заявки #{rid}: {date_val} {time_val}."
+    if action == "admin_change_delete":
+        return f"{role_label} скасував(ла) заявку #{rid} після запропонованих змін. Причина: {reason or 'не вказано'}."
+    if action == "admin_change_declined":
+        return f"{role_label} відмовив(ла) час адміністратора для заявки #{rid}. Причина: {reason or 'не вказано'}."
+    if action == "admin_change_proposed":
+        return f"{role_label} запропонував(ла) інший час для заявки #{rid}: {date_val} {time_val}. Причина: {reason or 'не вказано'}."
+    if action == "admin_keep_client_time":
+        return f"{role_label} залишив(ла) початковий час користувача для заявки #{rid}."
+    if action == "admin_keep_admin_time":
+        return f"{role_label} залишив(ла) свій час після відмови користувача для заявки #{rid}."
+    if action == "admin_accept_user_proposal":
+        return f"{role_label} прийняв(ла) пропозицію користувача для заявки #{rid}: {date_val} {time_val}."
+    if action == "admin_reject_user_proposal":
+        return f"{role_label} відхилив(ла) пропозицію користувача для заявки #{rid}. Причина: {reason or 'не вказано'}."
+
+    return f"{role_label} виконав(ла) дію: {ACTION_LABELS.get(action, action)}."
+
+
 async def log_action(
     actor_id: int | None,
     actor_role: str,
@@ -186,7 +240,10 @@ async def log_action(
 ):
     role_label = ROLE_LABELS.get(actor_role, actor_role or "Невідомо")
     action_label = ACTION_LABELS.get(action, action)
-    localized_details = _localize_detail_value(details) if details else None
+    base_details = dict(details or {})
+    description = build_action_description(action, role_label, base_details)
+    payload_source = {"description": description, **base_details}
+    localized_details = _localize_detail_value(payload_source)
     payload = json.dumps(localized_details, ensure_ascii=False) if localized_details else None
     async with SessionLocal() as session:
         session.add(
