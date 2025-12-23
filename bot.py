@@ -392,6 +392,41 @@ class GoogleSheetClient:
             logging.exception("Не вдалося додати заявку НП у Sheets: %s", exc)
             return False
 
+    async def _find_row_by_request_id(self, req_id: int) -> int | None:
+        """Find the sheet row for a request by its ID (column O)."""
+        try:
+            column_values = await asyncio.to_thread(self._worksheet.col_values, 15)
+        except Exception as exc:
+            logging.exception(
+                "Не вдалося отримати список ID для пошуку заявки %s: %s", req_id, exc
+            )
+            return None
+
+        for idx, value in enumerate(column_values[1:], start=2):
+            if value == str(req_id):
+                return idx
+
+        return None
+
+    async def _get_row_number(self, req: Request) -> int | None:
+        if not req.sheet_row:
+            return await self._find_row_by_request_id(req.id)
+
+        try:
+            cell = await asyncio.to_thread(self._worksheet.cell, req.sheet_row, 15)
+            if cell.value == str(req.id):
+                return req.sheet_row
+        except Exception as exc:
+            logging.exception(
+                "Не вдалося перевірити рядок %s для заявки %s: %s",
+                req.sheet_row,
+                req.id,
+                exc,
+            )
+
+        return await self._find_row_by_request_id(req.id)
+
+
     async def _store_row_number(self, req_id: int, row_number: int):
         async with SessionLocal() as session:
             req = await session.get(Request, req_id)
@@ -420,13 +455,14 @@ class GoogleSheetClient:
         if not await self._ensure_client():
             return
 
-        if not req.sheet_row:
+        row_number = await self._get_row_number(req)
+        if not row_number:
             return
 
         try:
-            await asyncio.to_thread(self._worksheet.delete_rows, req.sheet_row)
+            await asyncio.to_thread(self._worksheet.delete_rows, row_number)
         except Exception as exc:
-            logging.exception("Не вдалося видалити рядок %s у Sheets: %s", req.sheet_row, exc)
+            logging.exception("Не вдалося видалити рядок %s у Sheets: %s", row_number, exc)
 
     async def clear_requests(self):
         if not await self._ensure_client():
