@@ -165,6 +165,9 @@ class Request(Base):
     admin_id = Column(BigInteger, nullable=True)
     sheet_row = Column(Integer, nullable=True)
     completed_at = Column(TIMESTAMP, nullable=True)
+    pending_date = Column(Date, nullable=True)
+    pending_time = Column(Text, nullable=True)
+    pending_reason = Column(Text, nullable=True)
 
 
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -192,6 +195,12 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE requests ADD COLUMN completed_at TIMESTAMP"))
             if "cargo_description" not in cols:
                 sync_conn.execute(text("ALTER TABLE requests ADD COLUMN cargo_description TEXT"))
+            if "pending_date" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN pending_date DATE"))
+            if "pending_time" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN pending_time TEXT"))
+            if "pending_reason" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN pending_reason TEXT"))
 
             # backfill plan and timestamps for existing rows
             sync_conn.execute(text("UPDATE requests SET planned_date = date WHERE planned_date IS NULL"))
@@ -225,6 +234,9 @@ def get_sheet_status(status: str) -> str:
         "approved": "Принятая",
         "rejected": "Отклонённая",
         "deleted_by_user": "Удалена",
+        "pending_user_confirmation": "Ожидает подтверждения пользователя",
+        "pending_admin_decision": "Ожидает решения администратора",
+        "pending_user_final": "Ожидает окончательного подтверждения пользователя",
     }.get(status, status)
 
 
@@ -612,6 +624,17 @@ class NPDeliveryForm(StatesGroup):
     supplier = State()
     ttn = State()
 
+class UserChangeResponse(StatesGroup):
+    decline_reason = State()
+    delete_reason = State()
+    propose_reason = State()
+    calendar = State()
+    hour = State()
+    minute = State()
+
+class AdminUserProposalReject(StatesGroup):
+    reason = State()
+
 
 
 
@@ -722,6 +745,9 @@ def get_status_label(status: str) -> str:
         "approved": "✅ Підтверджена",
         "rejected": "❌ Відхилена",
         "deleted_by_user": "⛔ Скасована користувачем",
+        "pending_user_confirmation": "🟡 Чекає підтвердження користувача",
+        "pending_admin_decision": "🟠 Чекає рішення адміністратора",
+        "pending_user_final": "🟡 Очікує остаточного підтвердження",
     }.get(status, status)
 
 
@@ -761,6 +787,33 @@ def get_confirmed_datetime(req: Request) -> datetime | None:
         return datetime.combine(req.date, dtime(hour=hour, minute=minute), tzinfo=KYIV_TZ)
     except Exception:
         return None
+
+
+def build_user_change_keyboard(req_id: int, *, limited: bool = False):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Підтвердити", callback_data=f"user_change_confirm_{req_id}")
+    if not limited:
+        kb.button(text="🙅‍♂️ Відмовитися", callback_data=f"user_change_decline_{req_id}")
+        kb.button(text="📅 Запропонувати нову дату/час", callback_data=f"user_change_propose_{req_id}")
+    kb.button(text="🗑 Скасувати заявку", callback_data=f"user_change_delete_{req_id}")
+    kb.adjust(1)
+    kb.button(text=MAIN_MENU_TEXT, callback_data="go_main")
+    return kb.as_markup()
+
+
+def format_plan_datetime(req: Request) -> str:
+    plan_date = req.planned_date.strftime('%d.%m.%Y') if req.planned_date else ""
+    plan_time = req.planned_time or ""
+    return f"{plan_date} {plan_time}".strip()
+
+
+def merge_pending_reason(existing: str | None, prefix: str, reason: str) -> str:
+    reason = (reason or "").strip()
+    if not reason:
+        return existing or ""
+    parts = [existing] if existing else []
+    parts.append(f"{prefix}: {reason}")
+    return "\n".join(filter(None, parts))
 
 
 async def send_request_details(
@@ -1703,6 +1756,13 @@ def build_admin_request_view(req: Request, is_superadmin: bool):
         f"✅ <b>Підтверджено:</b> {req.date.strftime('%d.%m.%Y')} {req.time}\n"
         f"🏁 <b>Завершення:</b> {final_status}"
     )
+    if req.pending_date and req.pending_time:
+        text += (
+            f"\n📝 <b>Пропозиція користувача:</b> "
+            f"{req.pending_date.strftime('%d.%m.%Y')} {req.pending_time}"
+        )
+    if req.pending_reason:
+        text += f"\nℹ️ <b>Коментар:</b> {req.pending_reason}"
     kb = InlineKeyboardBuilder()
     kb.button(text="✔ Підтвердити", callback_data=f"adm_ok_{req.id}")
     kb.button(text="🔁 Змінити дату/час", callback_data=f"adm_change_{req.id}")
@@ -2619,6 +2679,98 @@ async def broadcast_new_request(req_id: int):
             await bot.send_message(admin.telegram_id, text, reply_markup=kb.as_markup())
         except:
             pass
+
+
+async def notify_user_about_admin_change(
+    req: Request,
+    *,
+    admin_reason: str | None = None,
+    limited: bool = False,
+    rejection_reason: str | None = None,
+):
+    reason_block = ""
+    if admin_reason:
+        reason_block += f"\nПричина зміни від адміністратора: {admin_reason}"
+    if rejection_reason:
+        reason_block += f"\nПричина відмови адміністратора: {rejection_reason}"
+
+    await bot.send_message(
+        req.user_id,
+        (
+            f"🔄 Адміністратор запропонував нові дату та час для вашої заявки #{req.id}.\n"
+            f"📅 {req.planned_date.strftime('%d.%m.%Y')}  ⏰ {req.planned_time}\n"
+            f"Відреагуйте, будь ласка:\n"
+            "• Підтвердіть запропонований час\n"
+            "• Вкажіть причину відмови\n"
+            "• Запропонуйте інший час або скасуйте заявку"
+            f"{reason_block}"
+        ),
+        reply_markup=build_user_change_keyboard(req.id, limited=limited),
+    )
+
+
+def build_admin_decision_keyboard(req_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Залишити час користувача", callback_data=f"adm_user_keep_client_{req_id}")
+    kb.button(text="🕒 Залишити час адміністратора", callback_data=f"adm_user_keep_admin_{req_id}")
+    kb.button(text="🔁 Призначити інший час", callback_data=f"adm_change_{req_id}")
+    kb.button(text="❌ Відхилити заявку", callback_data=f"adm_rej_{req_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def build_admin_user_proposal_keyboard(req_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Підтвердити час користувача", callback_data=f"adm_accept_user_proposal_{req_id}")
+    kb.button(text="❌ Відхилити час користувача", callback_data=f"adm_reject_user_proposal_{req_id}")
+    kb.button(text="🔁 Запропонувати інший час", callback_data=f"adm_change_{req_id}")
+    kb.button(text="🛑 Відхилити заявку", callback_data=f"adm_rej_{req_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def notify_admins_about_user_decline(req: Request, reason: str):
+    async with SessionLocal() as session:
+        admins = (await session.execute(select(Admin))).scalars().all()
+
+    plan_text = format_plan_datetime(req)
+    text = (
+        f"ℹ️ Користувач <b>{req.supplier}</b> відмовився від запропонованих змін для заявки #{req.id}.\n"
+        f"Поточний час (адм): {plan_text}\n"
+        f"Початковий час користувача: {req.date.strftime('%d.%m.%Y')} {req.time}\n"
+        f"Причина користувача: {reason}\n\n"
+        "Оберіть подальшу дію:"
+    )
+
+    for admin in admins:
+        try:
+            await bot.send_message(admin.telegram_id, text, reply_markup=build_admin_decision_keyboard(req.id))
+        except Exception:
+            pass
+
+
+async def notify_admins_about_user_proposal(req: Request, user_reason: str):
+    async with SessionLocal() as session:
+        admins = (await session.execute(select(Admin))).scalars().all()
+
+    plan_text = format_plan_datetime(req)
+    pending_text = ""
+    if req.pending_date and req.pending_time:
+        pending_text = f"{req.pending_date.strftime('%d.%m.%Y')} {req.pending_time}"
+
+    text = (
+        f"ℹ️ Користувач <b>{req.supplier}</b> запропонував новий час для заявки #{req.id}.\n"
+        f"Адмін пропонував: {plan_text}\n"
+        f"Нова пропозиція користувача: {pending_text}\n"
+        f"Причина користувача: {user_reason}\n\n"
+        "Потрібно прийняти рішення."
+    )
+
+    for admin in admins:
+        try:
+            await bot.send_message(admin.telegram_id, text, reply_markup=build_admin_user_proposal_keyboard(req.id))
+        except Exception:
+            pass
 ###############################################################
 #          ADMIN APPROVE / REJECT / CHANGE DATE-TIME          
 ###############################################################
@@ -2942,28 +3094,606 @@ async def adm_change_reason(message: types.Message, state: FSMContext):
             await state.clear()
             return await message.answer("Не вдалося змінити дату/час.")
 
-        req.date = new_date
-        req.time = new_time
-        req.status = "approved"
+        req.planned_date = new_date
+        req.planned_time = new_time
+        req.pending_date = None
+        req.pending_time = None
+        req.pending_reason = merge_pending_reason(None, "Admin", reason)
+        req.status = "pending_user_confirmation"
         req.admin_id = message.from_user.id
         set_updated_now(req)
         await session.commit()
+        await session.refresh(req)
 
-    await message.answer("🔁 Дата/час успішно змінені!")
+    await message.answer("🔁 Запит на зміну дати/часу надіслано користувачу для підтвердження.")
 
     await sheet_client.sync_request(req)
 
-    # Уведомление водителю
-    await bot.send_message(
-        req.user_id,
-        f"🔄 <b>Час вашої заявки #{req.id} змінено:</b>\n"
-        f"📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}\n"
-        f"Причина: {reason}"
+    await notify_user_about_admin_change(req, admin_reason=reason)
+
+    await notify_admins_about_action(req, "змінена (очікує підтвердження користувача)", reason=reason)
+
+    await state.clear()
+
+
+###############################################################
+#      USER REACTION TO ADMIN DATE/TIME CHANGE                
+###############################################################
+
+
+async def _load_request_for_user_decision(
+    req_id: int,
+    user_id: int,
+    allowed_statuses: set[str],
+) -> Request | None:
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.user_id != user_id or req.status not in allowed_statuses:
+            return None
+    return req
+
+
+@dp.callback_query(F.data.startswith("user_change_confirm_"))
+async def user_change_confirm(callback: types.CallbackQuery):
+    req_id = int(callback.data.split("_")[-1])
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.user_id != callback.from_user.id or req.status not in {"pending_user_confirmation", "pending_user_final"}:
+            return await callback.answer("Ця дія недоступна.", show_alert=True)
+        if not req.planned_date or not req.planned_time:
+            return await callback.answer("Немає запропонованої дати/часу.", show_alert=True)
+
+        req.date = req.planned_date
+        req.time = req.planned_time
+        req.status = "approved"
+        req.pending_date = None
+        req.pending_time = None
+        req.pending_reason = None
+        set_updated_now(req)
+        await session.commit()
+        await session.refresh(req)
+
+    await sheet_client.sync_request(req)
+
+    await callback.message.answer(
+        f"✅ Ви підтвердили запропоновані зміни. Заявка #{req.id} оновлена.\n"
+        f"📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}",
+        reply_markup=navigation_keyboard(include_back=False),
+    )
+    await callback.answer()
+    await notify_admins_about_action(req, "підтверджена користувачем після зміни")
+
+
+@dp.callback_query(F.data.startswith("user_change_delete_"))
+async def user_change_delete(callback: types.CallbackQuery, state: FSMContext):
+    req_id = int(callback.data.split("_")[-1])
+    req = await _load_request_for_user_decision(
+        req_id, callback.from_user.id, {"pending_user_confirmation", "pending_user_final"}
+    )
+    if not req:
+        return await callback.answer("Дія недоступна.", show_alert=True)
+
+    await state.set_state(UserChangeResponse.delete_reason)
+    await state.update_data(req_id=req_id)
+    await callback.message.answer(
+        "Вкажіть причину скасування заявки:", reply_markup=navigation_keyboard(include_back=False)
+    )
+    await callback.answer()
+
+
+@dp.message(UserChangeResponse.delete_reason)
+async def user_change_delete_reason(message: types.Message, state: FSMContext):
+    reason = (message.text or "").strip()
+    if not reason:
+        return await message.answer("Причина не може бути порожньою.")
+
+    data = await state.get_data()
+    req_id = data.get("req_id")
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.user_id != message.from_user.id or req.status not in {"pending_user_confirmation", "pending_user_final"}:
+            await state.clear()
+            return await message.answer("Заявку не знайдено або дія недоступна.")
+
+        req.status = "rejected"
+        req.pending_date = None
+        req.pending_time = None
+        req.pending_reason = merge_pending_reason(req.pending_reason, "User cancel", reason)
+        set_updated_now(req)
+        await session.commit()
+        await session.refresh(req)
+
+    await sheet_client.sync_request(req)
+
+    await message.answer(
+        f"Заявка #{req.id} відхилена за вашою ініціативою.",
+        reply_markup=navigation_keyboard(include_back=False),
+    )
+    await notify_admins_about_action(req, "відхилена користувачем після зміни", reason=reason)
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("user_change_decline_"))
+async def user_change_decline(callback: types.CallbackQuery, state: FSMContext):
+    req_id = int(callback.data.split("_")[-1])
+    req = await _load_request_for_user_decision(
+        req_id, callback.from_user.id, {"pending_user_confirmation"}
+    )
+    if not req:
+        return await callback.answer("Ця дія недоступна.", show_alert=True)
+
+    await state.set_state(UserChangeResponse.decline_reason)
+    await state.update_data(req_id=req_id)
+    await callback.message.answer(
+        "Вкажіть причину, чому ви не згодні з новим часом:", reply_markup=navigation_keyboard(include_back=False)
+    )
+    await callback.answer()
+
+
+@dp.message(UserChangeResponse.decline_reason)
+async def user_change_decline_reason(message: types.Message, state: FSMContext):
+    reason = (message.text or "").strip()
+    if not reason:
+        return await message.answer("Причина не може бути порожньою.")
+
+    data = await state.get_data()
+    req_id = data.get("req_id")
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.user_id != message.from_user.id or req.status != "pending_user_confirmation":
+            await state.clear()
+            return await message.answer("Дія недоступна або заявка не знайдена.")
+
+        req.status = "pending_admin_decision"
+        req.pending_reason = merge_pending_reason(req.pending_reason, "User", reason)
+        set_updated_now(req)
+        await session.commit()
+        await session.refresh(req)
+
+    await sheet_client.sync_request(req)
+
+    await message.answer(
+        "Вашу відмову зафіксовано. Адміністратор розгляне причину та відповість.",
+        reply_markup=navigation_keyboard(include_back=False),
+    )
+    await notify_admins_about_user_decline(req, reason)
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("user_change_propose_"))
+async def user_change_propose(callback: types.CallbackQuery, state: FSMContext):
+    req_id = int(callback.data.split("_")[-1])
+    req = await _load_request_for_user_decision(
+        req_id, callback.from_user.id, {"pending_user_confirmation"}
+    )
+    if not req:
+        return await callback.answer("Ця дія недоступна.", show_alert=True)
+
+    min_dt = min_planned_datetime(req.created_at)
+    await state.update_data(req_id=req_id, min_plan_dt=min_dt.isoformat())
+    await state.set_state(UserChangeResponse.propose_reason)
+    await callback.message.answer(
+        "Опишіть, чому вам не підходить запропонований час:",
+        reply_markup=navigation_keyboard(include_back=False),
+    )
+    await callback.answer()
+
+
+@dp.message(UserChangeResponse.propose_reason)
+async def user_change_propose_reason(message: types.Message, state: FSMContext):
+    reason = (message.text or "").strip()
+    if not reason:
+        return await message.answer("Причина не може бути порожньою.")
+
+    data = await state.get_data()
+    req_id = data.get("req_id")
+    await state.update_data(user_reason=reason)
+    await state.set_state(UserChangeResponse.calendar)
+
+    min_date = get_min_date_from_state(data)
+
+    await message.answer(
+        "Оберіть нову дату:",
+        reply_markup=build_date_calendar(
+            back_callback="user_change_cancel",
+            hide_sundays=True,
+            min_date=min_date,
+        ),
     )
 
-    # Уведомить всех админов
-    await notify_admins_about_action(req, "змінена (дата/час)", reason=reason)
 
+@dp.callback_query(UserChangeResponse.calendar, F.data.startswith("prev_"))
+async def user_change_prev(callback: types.CallbackQuery, state: FSMContext):
+    _, y, m = callback.data.split("_")
+    data = await state.get_data()
+    min_date = get_min_date_from_state(data)
+    await callback.message.edit_reply_markup(
+        reply_markup=build_date_calendar(
+            int(y),
+            int(m),
+            back_callback="user_change_cancel",
+            hide_sundays=True,
+            min_date=min_date,
+        )
+    )
+    await callback.answer()
+
+
+@dp.callback_query(UserChangeResponse.calendar, F.data.startswith("next_"))
+async def user_change_next(callback: types.CallbackQuery, state: FSMContext):
+    _, y, m = callback.data.split("_")
+    data = await state.get_data()
+    min_date = get_min_date_from_state(data)
+    await callback.message.edit_reply_markup(
+        reply_markup=build_date_calendar(
+            int(y),
+            int(m),
+            back_callback="user_change_cancel",
+            hide_sundays=True,
+            min_date=min_date,
+        )
+    )
+    await callback.answer()
+
+
+@dp.callback_query(UserChangeResponse.calendar, F.data == "close_calendar")
+async def user_change_close_calendar(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer(
+        "Скасовано вибір нового часу.",
+        reply_markup=navigation_keyboard(include_back=False),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(UserChangeResponse.calendar, F.data == "user_change_cancel")
+async def user_change_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer(
+        "Скасовано вибір нового часу.",
+        reply_markup=navigation_keyboard(include_back=False),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(UserChangeResponse.calendar, F.data.startswith("day_"))
+async def user_change_day(callback: types.CallbackQuery, state: FSMContext):
+    _, y, m, d = callback.data.split("_")
+    chosen = date(int(y), int(m), int(d))
+    data = await state.get_data()
+    min_date = get_min_date_from_state(data)
+    min_dt = get_min_datetime_from_state(data)
+
+    if chosen < kyiv_now().date():
+        return await callback.answer("Не можна обирати минулі дати", show_alert=True)
+
+    if min_date and chosen < min_date:
+        return await callback.answer(
+            "Можна обрати час не раніше ніж через 1 годину після створення заявки.",
+            show_alert=True,
+        )
+
+    if chosen.weekday() == 6:
+        return await callback.answer(
+            "Запис у неділю недоступний. Оберіть іншу дату.", show_alert=True
+        )
+
+    await state.update_data(new_date=chosen)
+
+    kb = InlineKeyboardBuilder()
+    hours = available_hours(chosen, earliest_dt=min_dt)
+    for hour in hours:
+        kb.button(text=f"{hour:02d}", callback_data=f"uchour_{hour:02d}")
+    kb.adjust(6)
+
+    if not hours:
+        await callback.message.answer(
+            "На цю дату немає доступних часових слотів. Оберіть іншу дату.",
+            reply_markup=add_inline_navigation(
+                InlineKeyboardBuilder(), back_callback="user_change_cancel"
+            ).as_markup(),
+        )
+        return await callback.answer()
+
+    await callback.message.answer(
+        "⏰ Оберіть годину:",
+        reply_markup=add_inline_navigation(kb, back_callback="user_change_cancel").as_markup()
+    )
+    await state.set_state(UserChangeResponse.hour)
+    await callback.answer()
+
+
+@dp.callback_query(UserChangeResponse.hour, F.data == "user_change_cancel")
+async def user_change_back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    chosen_date: date | None = data.get("new_date")
+    min_date = get_min_date_from_state(data)
+
+    if chosen_date:
+        markup = build_date_calendar(
+            chosen_date.year,
+            chosen_date.month,
+            back_callback="user_change_cancel",
+            hide_sundays=True,
+            min_date=min_date,
+        )
+    else:
+        markup = build_date_calendar(
+            back_callback="user_change_cancel", hide_sundays=True, min_date=min_date
+        )
+
+    await state.set_state(UserChangeResponse.calendar)
+    await callback.message.answer(
+        "Оберіть нову дату:",
+        reply_markup=markup,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(UserChangeResponse.hour, F.data.startswith("uchour_"))
+async def user_change_hour(callback: types.CallbackQuery, state: FSMContext):
+    hour = callback.data.replace("uchour_", "")
+    data = await state.get_data()
+    chosen_date: date | None = data.get("new_date")
+    min_dt = get_min_datetime_from_state(data)
+
+    if not chosen_date:
+        return await callback.answer("Оберіть дату", show_alert=True)
+
+    valid_hours = {f"{h:02d}" for h in available_hours(chosen_date, earliest_dt=min_dt)}
+    if hour not in valid_hours:
+        return await callback.answer("Цей час вже недоступний", show_alert=True)
+
+    await state.update_data(new_hour=hour)
+
+    kb = InlineKeyboardBuilder()
+    for m in available_minutes(chosen_date, int(hour), earliest_dt=min_dt):
+        kb.button(text=f"{m:02d}", callback_data=f"ucmin_{m:02d}")
+    kb.adjust(6)
+
+    await callback.message.answer(
+        "🕒 Оберіть хвилини:",
+        reply_markup=add_inline_navigation(kb, back_callback="user_change_cancel").as_markup()
+    )
+    await state.set_state(UserChangeResponse.minute)
+    await callback.answer()
+
+
+@dp.callback_query(UserChangeResponse.minute, F.data == "user_change_cancel")
+async def user_change_back_to_hour(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    chosen_date: date | None = data.get("new_date")
+    min_dt = get_min_datetime_from_state(data)
+
+    kb = InlineKeyboardBuilder()
+    if chosen_date:
+        hours = available_hours(chosen_date, earliest_dt=min_dt)
+        for h in hours:
+            kb.button(text=f"{h:02d}", callback_data=f"uchour_{h:02d}")
+    kb.adjust(6)
+
+    await state.set_state(UserChangeResponse.hour)
+    await callback.message.answer(
+        "⏰ Оберіть годину:",
+        reply_markup=add_inline_navigation(kb, back_callback="user_change_cancel").as_markup()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(UserChangeResponse.minute, F.data.startswith("ucmin_"))
+async def user_change_minute(callback: types.CallbackQuery, state: FSMContext):
+    minute = callback.data.replace("ucmin_", "")
+    data = await state.get_data()
+    req_id = data.get("req_id")
+    chosen_date: date | None = data.get("new_date")
+    chosen_hour = data.get("new_hour")
+    min_dt = get_min_datetime_from_state(data)
+    user_reason = data.get("user_reason", "")
+
+    if not chosen_date or chosen_date < kyiv_now().date():
+        return await callback.answer("Оберіть доступну дату", show_alert=True)
+
+    if chosen_hour is None:
+        return await callback.answer("Спочатку оберіть годину", show_alert=True)
+
+    if min_dt:
+        min_date = min_dt.date()
+        if chosen_date < min_date:
+            return await callback.answer(
+                "Можна обрати час не раніше ніж через 1 годину після створення заявки.",
+                show_alert=True,
+            )
+
+    if int(minute) not in available_minutes(
+        chosen_date, int(chosen_hour), earliest_dt=min_dt
+    ):
+        return await callback.answer("Цей час вже недоступний", show_alert=True)
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.user_id != callback.from_user.id or req.status != "pending_user_confirmation":
+            await state.clear()
+            return await callback.answer("Дія недоступна.", show_alert=True)
+
+        req.pending_date = chosen_date
+        req.pending_time = f"{int(chosen_hour):02d}:{int(minute):02d}"
+        req.status = "pending_admin_decision"
+        req.pending_reason = merge_pending_reason(req.pending_reason, "User", user_reason)
+        set_updated_now(req)
+        await session.commit()
+        await session.refresh(req)
+
+    await sheet_client.sync_request(req)
+
+    await callback.message.answer(
+        "Пропозицію щодо нового часу відправлено адміністратору. Очікуйте відповіді.",
+        reply_markup=navigation_keyboard(include_back=False),
+    )
+    await notify_admins_about_user_proposal(req, user_reason)
+    await state.clear()
+    await callback.answer()
+
+
+###############################################################
+#        ADMIN DECISIONS AFTER USER RESPONSE                  
+###############################################################
+
+
+@dp.callback_query(F.data.startswith("adm_user_keep_client_"))
+async def adm_keep_client_time(callback: types.CallbackQuery):
+    if not await is_admin_user(callback.from_user.id):
+        return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
+
+    req_id = int(callback.data.split("_")[-1])
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.status not in {"pending_admin_decision", "pending_user_confirmation", "pending_user_final"}:
+            return await callback.answer("Заявка недоступна для цієї дії.", show_alert=True)
+
+        req.planned_date = req.date
+        req.planned_time = req.time
+        req.pending_date = None
+        req.pending_time = None
+        req.pending_reason = None
+        req.status = "approved"
+        req.admin_id = callback.from_user.id
+        set_updated_now(req)
+        await session.commit()
+        await session.refresh(req)
+
+    await sheet_client.sync_request(req)
+
+    await callback.message.answer("✅ Залишили час користувача та підтвердили заявку.")
+    await bot.send_message(
+        req.user_id,
+        f"✅ Адміністратор залишив ваш початковий час для заявки #{req.id}.\n"
+        f"📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}",
+    )
+    await notify_admins_about_action(req, "підтверджена (залишено час користувача)")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_user_keep_admin_"))
+async def adm_keep_admin_time(callback: types.CallbackQuery):
+    if not await is_admin_user(callback.from_user.id):
+        return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
+
+    req_id = int(callback.data.split("_")[-1])
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.status not in {"pending_admin_decision", "pending_user_confirmation"}:
+            return await callback.answer("Заявка недоступна для цієї дії.", show_alert=True)
+
+        req.status = "pending_user_final"
+        req.pending_reason = merge_pending_reason(
+            req.pending_reason,
+            "Admin",
+            "Адміністратор залишив запропонований час після відмови користувача.",
+        )
+        set_updated_now(req)
+        await session.commit()
+        await session.refresh(req)
+
+    await sheet_client.sync_request(req)
+
+    await callback.message.answer(
+        "⏳ Очікуємо остаточне рішення користувача щодо часу адміністратора."
+    )
+    await notify_user_about_admin_change(
+        req,
+        admin_reason="Адміністратор залишив запропонований раніше час.",
+        limited=True,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_accept_user_proposal_"))
+async def adm_accept_user_proposal(callback: types.CallbackQuery):
+    if not await is_admin_user(callback.from_user.id):
+        return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
+
+    req_id = int(callback.data.split("_")[-1])
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.status != "pending_admin_decision" or not req.pending_date or not req.pending_time:
+            return await callback.answer("Немає пропозиції користувача для підтвердження.", show_alert=True)
+
+        req.planned_date = req.pending_date
+        req.planned_time = req.pending_time
+        req.date = req.pending_date
+        req.time = req.pending_time
+        req.pending_date = None
+        req.pending_time = None
+        req.pending_reason = None
+        req.status = "approved"
+        req.admin_id = callback.from_user.id
+        set_updated_now(req)
+        await session.commit()
+        await session.refresh(req)
+
+    await sheet_client.sync_request(req)
+
+    await callback.message.answer("✅ Пропозиція користувача підтверджена.")
+    await bot.send_message(
+        req.user_id,
+        f"✅ Адміністратор підтвердив запропонований вами час для заявки #{req.id}.\n"
+        f"📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}",
+    )
+    await notify_admins_about_action(req, "підтверджена (час користувача)")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_reject_user_proposal_"))
+async def adm_reject_user_proposal(callback: types.CallbackQuery, state: FSMContext):
+    if not await is_admin_user(callback.from_user.id):
+        return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
+
+    req_id = int(callback.data.split("_")[-1])
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.status != "pending_admin_decision":
+            return await callback.answer("Дія недоступна.", show_alert=True)
+
+    await state.set_state(AdminUserProposalReject.reason)
+    await state.update_data(req_id=req_id)
+    await callback.message.answer(
+        "Вкажіть причину відхилення пропозиції користувача:",
+        reply_markup=navigation_keyboard(include_back=False),
+    )
+    await callback.answer()
+
+
+@dp.message(AdminUserProposalReject.reason)
+async def adm_reject_user_proposal_reason(message: types.Message, state: FSMContext):
+    reason = (message.text or "").strip()
+    if not reason:
+        return await message.answer("Причина не може бути порожньою.")
+
+    data = await state.get_data()
+    req_id = data.get("req_id")
+
+    async with SessionLocal() as session:
+        req = await session.get(Request, req_id)
+        if not req or req.status != "pending_admin_decision":
+            await state.clear()
+            return await message.answer("Заявка не знайдена або дія недоступна.")
+
+        req.pending_date = None
+        req.pending_time = None
+        req.status = "pending_user_final"
+        req.pending_reason = merge_pending_reason(req.pending_reason, "Admin", reason)
+        req.admin_id = message.from_user.id
+        set_updated_now(req)
+        await session.commit()
+        await session.refresh(req)
+
+    await sheet_client.sync_request(req)
+
+    await message.answer("Відповідь користувачу надіслано.")
+    await notify_user_about_admin_change(req, rejection_reason=reason, limited=True)
     await state.clear()
 
 
