@@ -778,6 +778,14 @@ def build_recent_request_ids(reqs: list[Request]) -> set[int]:
 def set_updated_now(req: Request):
     req.updated_at = kyiv_now_naive()
 
+def get_user_modify_block_reason(req: Request) -> str | None:
+    if req.status == "deleted_by_user":
+        return "Заявка вже видалена"
+    if req.completed_at:
+        return "Заявка вже завершена, зміни неможливі"
+    if req.status == "rejected":
+        return "Заявка відхилена адміністратором, редагування неможливе"
+    return None
 
 def get_confirmed_datetime(req: Request) -> datetime | None:
     if not req.date or not req.time:
@@ -827,8 +835,7 @@ async def send_request_details(
     if (
         allow_actions
         and req.id in (recent_ids or set())
-        and req.status != "deleted_by_user"
-        and not req.completed_at
+        and not get_user_modify_block_reason(req)
     ):
         kb.button(text="✏️ Змінити", callback_data=f"my_edit_{req.id}")
         kb.button(text="🗑 Видалити", callback_data=f"my_delete_{req.id}")
@@ -871,6 +878,17 @@ async def my_view(callback: types.CallbackQuery):
     if not req or req.user_id != user_id:
         return await callback.answer("Заявка не знайдена", show_alert=True)
 
+    block_reason = get_user_modify_block_reason(req)
+    if block_reason:
+        recent = await get_user_recent_requests(user_id)
+        await send_request_details(
+            req,
+            callback,
+            allow_actions=False,
+            recent_ids=build_recent_request_ids(recent),
+        )
+        return
+
     recent = await get_user_recent_requests(user_id)
     await send_request_details(req, callback, allow_actions=True, recent_ids=build_recent_request_ids(recent))
 
@@ -896,11 +914,9 @@ async def my_delete(callback: types.CallbackQuery, state: FSMContext):
     if not is_request_recent(req_id, recent_ids):
         return await callback.answer("Можна керувати лише останніми 3 заявками", show_alert=True)
 
-    if req.status == "deleted_by_user":
-        return await callback.answer("Заявка вже видалена", show_alert=True)
-
-    if req.completed_at:
-        return await callback.answer("Заявка вже завершена, зміни неможливі", show_alert=True)
+    block_reason = get_user_modify_block_reason(req)
+    if block_reason:
+        return await callback.answer(block_reason, show_alert=True)
 
     await state.set_state(UserDeleteForm.reason)
     await state.update_data(req_id=req_id)
@@ -959,9 +975,10 @@ async def my_delete_reason(message: types.Message, state: FSMContext):
             await state.clear()
             return await message.answer("Заявка не знайдена або вам не належить.")
 
-        if req.completed_at:
+        block_reason = get_user_modify_block_reason(req)
+        if block_reason:
             await state.clear()
-            return await message.answer("Заявка вже завершена, зміни неможливі.")
+            return await message.answer(block_reason)
 
         req_data = {
             "id": req.id,
@@ -1003,11 +1020,9 @@ async def my_edit(callback: types.CallbackQuery, state: FSMContext):
     if not is_request_recent(req_id, recent_ids):
         return await callback.answer("Можна керувати лише останніми 3 заявками", show_alert=True)
 
-    if req.status == "deleted_by_user":
-        return await callback.answer("Заявка вже видалена", show_alert=True)
-
-    if req.completed_at:
-        return await callback.answer("Заявка вже завершена, редагування неможливе", show_alert=True)
+    block_reason = get_user_modify_block_reason(req)
+    if block_reason:
+        return await callback.answer(block_reason, show_alert=True)
 
     await state.set_state(UserEditForm.reason)
     await state.update_data(req_id=req_id)
@@ -1043,9 +1058,10 @@ async def my_edit_reason(message: types.Message, state: FSMContext):
             await state.clear()
             return await message.answer("Заявка не знайдена або вам не належить.")
 
-        if req.completed_at:
+        block_reason = get_user_modify_block_reason(req)
+        if block_reason:
             await state.clear()
-            return await message.answer("Заявка вже завершена, редагування неможливе.")
+            return await message.answer(block_reason)
 
     await state.update_data(reason=reason)
     await state.set_state(UserEditForm.field_choice)
@@ -1089,7 +1105,12 @@ async def _load_request_for_edit(state: FSMContext, user_id: int) -> tuple[Reque
     async with SessionLocal() as session:
         req = await session.get(Request, req_id)
 
-    if not req or req.user_id != user_id or req.completed_at:
+    if not req or req.user_id != user_id:
+        await state.clear()
+        return None, None
+
+    block_reason = get_user_modify_block_reason(req)
+    if block_reason:
         await state.clear()
         return None, None
 
