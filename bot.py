@@ -9,6 +9,7 @@ import json
 import asyncio
 import logging
 from datetime import datetime, date, timedelta, time as dtime
+from tempfile import NamedTemporaryFile
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     InlineKeyboardButton,
+    BufferedInputFile,
 )
 
 from sqlalchemy.ext.asyncio import (
@@ -36,6 +38,8 @@ from sqlalchemy import (
     Column, Integer, BigInteger, String, Boolean,
     Date, Text, TIMESTAMP, select, delete, text, inspect
 )
+
+from openpyxl import Workbook
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -91,6 +95,33 @@ def get_min_datetime_from_state(data: dict[str, Any]) -> datetime | None:
     else:
         return None
     return to_kyiv(raw_dt)
+
+
+def parse_date_input(raw: str) -> date | None:
+    try:
+        return datetime.strptime(raw.strip(), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+async def log_action(
+    actor_id: int | None,
+    actor_role: str,
+    action: str,
+    details: dict[str, Any] | None = None,
+):
+    payload = json.dumps(details, ensure_ascii=False) if details else None
+    async with SessionLocal() as session:
+        session.add(
+            ActionLog(
+                actor_id=actor_id,
+                actor_role=actor_role,
+                action=action,
+                details=payload,
+                created_at=kyiv_now_naive(),
+            )
+        )
+        await session.commit()
 
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -168,6 +199,17 @@ class Request(Base):
     pending_date = Column(Date, nullable=True)
     pending_time = Column(Text, nullable=True)
     pending_reason = Column(Text, nullable=True)
+
+
+class ActionLog(Base):
+    __tablename__ = "action_logs"
+
+    id = Column(Integer, primary_key=True)
+    actor_id = Column(BigInteger, nullable=True)
+    actor_role = Column(String(50), nullable=False)
+    action = Column(Text, nullable=False)
+    details = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, default=kyiv_now_naive)
 
 
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -563,6 +605,7 @@ def admin_menu(is_superadmin: bool = False):
     kb.button(text="📚 Усі заявки", callback_data="admin_all")
     kb.button(text="🔎 Пошук за ID", callback_data="admin_search")
     kb.button(text="📅 Посмотреть слоты очереди", callback_data="admin_slots_view")
+    kb.button(text="📑 Експорт логів", callback_data="admin_logs_export")
     if is_superadmin:
         kb.button(text="➕ Додати адміна", callback_data="admin_add")
         kb.button(text="➖ Видалити адміна", callback_data="admin_remove")
@@ -636,6 +679,10 @@ class AdminRejectForm(StatesGroup):
 
 class AdminPlanView(StatesGroup):
     calendar = State()
+
+class AdminLogsExport(StatesGroup):
+    start_date = State()
+    end_date = State()
 
 class UserDeleteForm(StatesGroup):
     user_id = State()
@@ -1029,6 +1076,13 @@ async def my_delete_reason(message: types.Message, state: FSMContext):
         await session.delete(req)
         await session.commit()
 
+    await log_action(
+        message.from_user.id,
+        "user",
+        "request_deleted",
+        {"request_id": req_id, "reason": reason},
+    )
+
     await sheet_client.delete_request(req)
 
     await notify_admins_about_user_deletion(req_data, reason)
@@ -1123,6 +1177,19 @@ async def finalize_user_edit_update(
     async with SessionLocal() as session:
         session.add(req)
         await session.commit()
+
+    await log_action(
+        req.user_id,
+        "user",
+        "request_updated",
+        {
+            "request_id": req.id,
+            "reason": reason,
+            "changes": [
+                {"field": label, "old": old, "new": new} for label, old, new in changes
+            ],
+        },
+    )
 
     target = message_or_callback.message if isinstance(message_or_callback, types.CallbackQuery) else message_or_callback
     await target.answer(text, reply_markup=navigation_keyboard(include_back=False))
@@ -1795,6 +1862,134 @@ async def admin_slots_choose_date(callback: types.CallbackQuery, state: FSMConte
     )
     await callback.answer()
 
+###############################################################
+#                      ADMIN — LOGS EXPORT                    
+###############################################################
+
+async def fetch_logs_between(start_dt: datetime, end_dt: datetime) -> list[ActionLog]:
+    async with SessionLocal() as session:
+        res = await session.execute(
+            select(ActionLog)
+            .where(ActionLog.created_at >= start_dt, ActionLog.created_at <= end_dt)
+            .order_by(ActionLog.created_at)
+        )
+        return res.scalars().all()
+
+
+def build_logs_excel(logs: list[ActionLog], start_dt: datetime, end_dt: datetime) -> str:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Логи"
+    ws.append(["Дата/час (Київ)", "Роль", "Telegram ID", "Дія", "Деталі"])
+
+    for log in logs:
+        log_time = to_kyiv(log.created_at) if log.created_at else None
+        created_str = log_time.strftime("%d.%m.%Y %H:%M:%S") if log_time else ""
+        details_text = ""
+        if log.details:
+            try:
+                parsed = json.loads(log.details)
+                if isinstance(parsed, dict):
+                    details_text = "; ".join(f"{k}: {v}" for k, v in parsed.items())
+                else:
+                    details_text = str(parsed)
+            except Exception:
+                details_text = log.details
+
+        ws.append([
+            created_str,
+            log.actor_role,
+            str(log.actor_id) if log.actor_id is not None else "",
+            log.action,
+            details_text,
+        ])
+
+    start_label = start_dt.strftime("%Y%m%d")
+    end_label = end_dt.strftime("%Y%m%d")
+    tmp = NamedTemporaryFile(delete=False, suffix=f"_{start_label}_{end_label}.xlsx")
+    wb.save(tmp.name)
+    return tmp.name
+
+
+@dp.callback_query(F.data == "admin_logs_export")
+async def admin_logs_export(callback: types.CallbackQuery, state: FSMContext):
+    if not await is_admin_user(callback.from_user.id):
+        return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
+
+    await state.set_state(AdminLogsExport.start_date)
+    await callback.message.answer(
+        "Введіть початкову дату у форматі YYYY-MM-DD:",
+        reply_markup=navigation_keyboard(include_back=False),
+    )
+    await callback.answer()
+
+
+@dp.message(AdminLogsExport.start_date)
+async def admin_logs_export_start_date(message: types.Message, state: FSMContext):
+    start = parse_date_input(message.text or "")
+    if not start:
+        return await message.answer("Невірний формат. Використовуйте YYYY-MM-DD.")
+
+    await state.update_data(start_date=start)
+    await state.set_state(AdminLogsExport.end_date)
+    await message.answer(
+        "Введіть кінцеву дату у форматі YYYY-MM-DD:",
+        reply_markup=navigation_keyboard(include_back=False),
+    )
+
+
+@dp.message(AdminLogsExport.end_date)
+async def admin_logs_export_end_date(message: types.Message, state: FSMContext):
+    end = parse_date_input(message.text or "")
+    if not end:
+        return await message.answer("Невірний формат. Використовуйте YYYY-MM-DD.")
+
+    data = await state.get_data()
+    start: date | None = data.get("start_date")
+    if not start:
+        await state.clear()
+        return await message.answer("Сталася помилка. Почніть експорт ще раз.")
+
+    if end < start:
+        return await message.answer("Кінцева дата не може бути раніше початкової.")
+
+    start_dt = datetime.combine(start, dtime.min)
+    end_dt = datetime.combine(end, dtime.max)
+
+    logs = await fetch_logs_between(start_dt, end_dt)
+    if not logs:
+        await state.clear()
+        return await message.answer(
+            "Логів за вказаний період не знайдено.",
+            reply_markup=navigation_keyboard(include_back=False),
+        )
+
+    file_path = build_logs_excel(logs, start_dt, end_dt)
+    try:
+        with open(file_path, "rb") as f:
+            doc = BufferedInputFile(
+                f.read(),
+                filename=f"logs_{start_dt.date()}_{end_dt.date()}.xlsx",
+            )
+            await message.answer_document(
+                doc,
+                caption="Файл з логами дій за обраний період.",
+            )
+    finally:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+
+    await log_action(
+        message.from_user.id,
+        "admin" if message.from_user.id != SUPERADMIN_ID else "superadmin",
+        "logs_export",
+        {"start": str(start), "end": str(end)},
+    )
+
+    await state.clear()
+
 
 def build_admin_request_view(req: Request, is_superadmin: bool):
     status = get_status_label(req.status)
@@ -2006,6 +2201,13 @@ async def admin_add_wait_last_name(message: types.Message, state: FSMContext):
         )
         await session.commit()
 
+    await log_action(
+        message.from_user.id,
+        "superadmin",
+        "admin_added",
+        {"telegram_id": tg_id, "last_name": admin_last_name},
+    )
+
     await state.clear()
     await message.answer(
         f"✔ Адміністратор <b>{admin_last_name}</b> доданий.",
@@ -2076,6 +2278,13 @@ async def admin_remove_wait(message: types.Message, state: FSMContext):
         await session.delete(admin)
         await session.commit()
 
+    await log_action(
+        message.from_user.id,
+        "superadmin",
+        "admin_removed",
+        {"telegram_id": tg_id, "name": admin_name},
+    )
+
     await state.clear()
     await message.answer(
         f"🗑 Адміністратора <b>{admin_name}</b> видалено.",
@@ -2113,6 +2322,13 @@ async def admin_clear_yes(callback: types.CallbackQuery):
     async with SessionLocal() as session:
         await session.execute(delete(Request))
         await session.commit()
+
+    await log_action(
+        callback.from_user.id,
+        "superadmin" if callback.from_user.id == SUPERADMIN_ID else "admin",
+        "database_cleared",
+        None,
+    )
 
     await sheet_client.clear_requests()
 
@@ -2162,6 +2378,13 @@ async def np_ttn_step(message: types.Message, state: FSMContext):
 
     saved = await sheet_client.append_np_delivery(supplier, ttn)
     await notify_admins_np_delivery(supplier, ttn)
+
+    await log_action(
+        message.from_user.id,
+        "user",
+        "np_delivery_submitted",
+        {"supplier": supplier, "ttn": ttn, "saved_to_sheet": saved},
+    )
 
     if saved:
         await message.answer(
@@ -2669,6 +2892,18 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
         await session.commit()
         await session.refresh(req)
 
+    await log_action(
+        callback.from_user.id,
+        "user",
+        "request_created",
+        {
+            "request_id": req.id,
+            "supplier": req.supplier,
+            "planned_date": str(req.planned_date),
+            "planned_time": req.planned_time,
+        },
+    )
+
     await callback.message.answer(
         f"✅ Заявка #{req.id} відправлена на розгляд.\n"
         f"📅 {req.date.strftime('%d.%m.%Y')} • ⏰ {req.time}",
@@ -2843,6 +3078,13 @@ async def adm_ok(callback: types.CallbackQuery):
         set_updated_now(req)
         await session.commit()
 
+    await log_action(
+        callback.from_user.id,
+        "admin" if callback.from_user.id != SUPERADMIN_ID else "superadmin",
+        "request_approved",
+        {"request_id": req.id},
+    )
+
     await callback.message.answer("✔ Підтверджено!")
 
     await sheet_client.sync_request(req)
@@ -2890,6 +3132,13 @@ async def adm_rej_reason(message: types.Message, state: FSMContext):
         set_updated_now(req)
         await session.commit()
 
+    await log_action(
+        message.from_user.id,
+        "admin" if message.from_user.id != SUPERADMIN_ID else "superadmin",
+        "request_rejected",
+        {"request_id": req.id, "reason": reason},
+    )
+
     await message.answer("❌ Заявку відхилено.")
 
     await sheet_client.sync_request(req)
@@ -2920,7 +3169,12 @@ async def adm_finish(callback: types.CallbackQuery):
     if not (is_superadmin or admin):
         return await callback.answer("⛔ Ви не адміністратор.", show_alert=True)
 
-    req = await complete_request(req_id, auto=False)
+    req = await complete_request(
+        req_id,
+        auto=False,
+        actor_id=user_id,
+        actor_role="superadmin" if is_superadmin else "admin",
+    )
     if not req:
         return await callback.answer(
             "Не можна завершити: заявка не підтверджена або вже завершена.",
@@ -2958,6 +3212,13 @@ async def adm_delete(callback: types.CallbackQuery):
 
         await session.delete(req)
         await session.commit()
+
+    await log_action(
+        user_id,
+        "superadmin" if is_superadmin else "admin",
+        "request_deleted_by_admin",
+        {"request_id": req_id},
+    )
 
     await sheet_client.delete_request(req)
 
@@ -3162,6 +3423,18 @@ async def adm_change_reason(message: types.Message, state: FSMContext):
         await session.commit()
         await session.refresh(req)
 
+    await log_action(
+        message.from_user.id,
+        "admin" if message.from_user.id != SUPERADMIN_ID else "superadmin",
+        "admin_change_time",
+        {
+            "request_id": req_id,
+            "new_date": str(new_date),
+            "new_time": new_time,
+            "reason": reason,
+        },
+    )
+
     await message.answer("🔁 Запит на зміну дати/часу надіслано користувачу для підтвердження.")
 
     await sheet_client.sync_request(req)
@@ -3210,6 +3483,17 @@ async def user_change_confirm(callback: types.CallbackQuery):
         set_updated_now(req)
         await session.commit()
         await session.refresh(req)
+
+    await log_action(
+        callback.from_user.id,
+        "user",
+        "admin_change_confirmed",
+        {
+            "request_id": req.id,
+            "date": str(req.date),
+            "time": req.time,
+        },
+    )
 
     await sheet_client.sync_request(req)
 
@@ -3262,6 +3546,13 @@ async def user_change_delete_reason(message: types.Message, state: FSMContext):
         await session.commit()
         await session.refresh(req)
 
+    await log_action(
+        message.from_user.id,
+        "user",
+        "admin_change_delete",
+        {"request_id": req_id, "reason": reason},
+    )
+
     await sheet_client.sync_request(req)
 
     await message.answer(
@@ -3309,6 +3600,13 @@ async def user_change_decline_reason(message: types.Message, state: FSMContext):
         set_updated_now(req)
         await session.commit()
         await session.refresh(req)
+
+    await log_action(
+        message.from_user.id,
+        "user",
+        "admin_change_declined",
+        {"request_id": req.id, "reason": reason},
+    )
 
     await sheet_client.sync_request(req)
 
@@ -3583,6 +3881,18 @@ async def user_change_minute(callback: types.CallbackQuery, state: FSMContext):
         await session.commit()
         await session.refresh(req)
 
+    await log_action(
+        callback.from_user.id,
+        "user",
+        "admin_change_proposed",
+        {
+            "request_id": req.id,
+            "proposed_date": str(req.pending_date),
+            "proposed_time": req.pending_time,
+            "reason": user_reason,
+        },
+    )
+
     await sheet_client.sync_request(req)
 
     await callback.message.answer(
@@ -3621,6 +3931,13 @@ async def adm_keep_client_time(callback: types.CallbackQuery):
         await session.commit()
         await session.refresh(req)
 
+    await log_action(
+        callback.from_user.id,
+        "admin" if callback.from_user.id != SUPERADMIN_ID else "superadmin",
+        "admin_keep_client_time",
+        {"request_id": req.id},
+    )
+
     await sheet_client.sync_request(req)
 
     await callback.message.answer("✅ Залишили час користувача та підтвердили заявку.")
@@ -3653,6 +3970,13 @@ async def adm_keep_admin_time(callback: types.CallbackQuery):
         set_updated_now(req)
         await session.commit()
         await session.refresh(req)
+
+    await log_action(
+        callback.from_user.id,
+        "admin" if callback.from_user.id != SUPERADMIN_ID else "superadmin",
+        "admin_keep_admin_time",
+        {"request_id": req.id},
+    )
 
     await sheet_client.sync_request(req)
 
@@ -3690,6 +4014,13 @@ async def adm_accept_user_proposal(callback: types.CallbackQuery):
         set_updated_now(req)
         await session.commit()
         await session.refresh(req)
+
+    await log_action(
+        callback.from_user.id,
+        "admin" if callback.from_user.id != SUPERADMIN_ID else "superadmin",
+        "admin_accept_user_proposal",
+        {"request_id": req.id, "date": str(req.date), "time": req.time},
+    )
 
     await sheet_client.sync_request(req)
 
@@ -3746,6 +4077,13 @@ async def adm_reject_user_proposal_reason(message: types.Message, state: FSMCont
         set_updated_now(req)
         await session.commit()
         await session.refresh(req)
+
+    await log_action(
+        message.from_user.id,
+        "admin" if message.from_user.id != SUPERADMIN_ID else "superadmin",
+        "admin_reject_user_proposal",
+        {"request_id": req.id, "reason": reason},
+    )
 
     await sheet_client.sync_request(req)
 
@@ -3832,7 +4170,13 @@ COMPLETION_MESSAGE = (
 )
 
 
-async def complete_request(req_id: int, *, auto: bool = False) -> Request | None:
+async def complete_request(
+    req_id: int,
+    *,
+    auto: bool = False,
+    actor_id: int | None = None,
+    actor_role: str | None = None,
+) -> Request | None:
     async with SessionLocal() as session:
         req = await session.get(Request, req_id)
         if not req or req.completed_at or req.status != "approved":
@@ -3842,6 +4186,13 @@ async def complete_request(req_id: int, *, auto: bool = False) -> Request | None
         set_updated_now(req)
         await session.commit()
         await session.refresh(req)
+
+    await log_action(
+        actor_id,
+        actor_role or ("system" if auto else "admin"),
+        "request_completed",
+        {"request_id": req_id, "auto": auto},
+    )
 
     await sheet_client.sync_request(req)
 
@@ -3891,7 +4242,7 @@ async def _auto_close_tick():
             close_after = approved_at + timedelta(hours=20)
 
         if now >= close_after:
-            await complete_request(req.id, auto=True)
+            await complete_request(req.id, auto=True, actor_role="system")
             
 ###############################################################
 #                         BOT STARTUP                         
