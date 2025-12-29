@@ -618,10 +618,13 @@ class GoogleSheetClient:
         admin_name = await get_admin_display_name(req.admin_id)
         values = self._build_row(req, admin_name)
 
-        if req.sheet_row:
-            updated = await self._update_row(req.sheet_row, values)
+        row_number = await self._get_row_number(req)
+        if row_number:
+            updated = await self._update_row(row_number, values)
             if updated:
-                return
+                if req.sheet_row != row_number:
+                    await self._store_row_number(req.id, row_number)
+            return
 
         row_number = await self._append_row(values)
         if row_number:
