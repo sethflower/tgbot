@@ -1521,7 +1521,7 @@ async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContex
 
     prompts = {
         "supplier": (UserEditForm.supplier, "Введіть нову назву постачальника:"),
-        "phone": (UserEditForm.phone, "Введіть новий номер телефону:"),
+        "phone": (UserEditForm.phone, "Введіть новий номер телефону у форматі 380......... без знаку +:"),
         "car": (UserEditForm.car, "Введіть новий об'єм вантажу:"),
         "cargo_description": (
             UserEditForm.cargo_description,
@@ -2556,7 +2556,7 @@ async def step_supplier(message: types.Message, state: FSMContext):
     await state.update_data(supplier=supplier)
 
     await message.answer(
-        "📞 <b>Крок 2/6</b>\nЗалиште контактний номер телефону:",
+        "📞 <b>Крок 2/6</b>\nЗалиште контактний номер телефону у форматі 380......... без знаку +:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.phone)
@@ -2573,7 +2573,7 @@ async def step_phone(message: types.Message, state: FSMContext):
 
     phone = message.text.strip()
     if not phone:
-        return await message.answer("⚠️ Вкажіть номер телефону для зв'язку.")
+        return await message.answer("⚠️ Вкажіть номер телефону для зв'язку у форматі 380......... без знаку +")
 
     await state.update_data(phone=phone)
 
@@ -2589,7 +2589,7 @@ async def step_car(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.phone)
         return await message.answer(
-            "📞 <b>Крок 2/6</b>\nЗалиште контактний номер телефону:",
+            "📞 <b>Крок 2/6</b>\nЗалиште контактний номер телефону у форматі 380......... без знаку + :",
             reply_markup=navigation_keyboard(),
         )
 
