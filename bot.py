@@ -2776,7 +2776,7 @@ def available_minutes(
         return []
 
     # Години роботи: 09:00–16:00 з кроком 30 хвилин (00 та 30)
-    minutes = [0, 30]
+    minutes = [0] if hour == 16 else [0, 30]
 
     if earliest_dt and selected_date == earliest_dt.date():
         if hour < earliest_dt.hour:
@@ -2817,7 +2817,7 @@ def available_hours(
 def all_slots_for_day(selected_date: date) -> list[str]:
     slots: list[str] = []
     for hour in range(9, 17):
-        minutes = [0, 30]
+        minutes = [0] if hour == 16 else [0, 30]
         for minute in minutes:
             slots.append(f"{hour:02d}:{minute:02d}")
     return slots
