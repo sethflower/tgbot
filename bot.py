@@ -4,7 +4,7 @@
 #                     FULL PROFESSIONAL EDITION               
 ###############################################################
 
-import os
+import osqqqqq
 import json
 import asyncio
 import logging
