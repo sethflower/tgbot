@@ -970,12 +970,18 @@ def get_status_label(status: str) -> str:
         "pending_user_final": "🟡 Очікує остаточного підтвердження",
     }.get(status, status)
 
+def get_confirmed_label(req: Request) -> str:
+    if req.status != "approved":
+        return "—"
+    return f"{req.date.strftime('%d.%m.%Y')} {req.time}"
+
 
 def format_request_text(req: Request) -> str:
     status = get_status_label(req.status)
     final_status = "Завершена" if req.completed_at else "Не завершена"
     planned_date = req.planned_date.strftime('%d.%m.%Y') if req.planned_date else req.date.strftime('%d.%m.%Y')
     planned_time = req.planned_time if req.planned_time else req.time
+    confirmed = get_confirmed_label(req)
     return (
         f"<b>📄 Заявка #{req.id}</b>\n"
         f"Статус: {status}\n"
@@ -986,7 +992,7 @@ def format_request_text(req: Request) -> str:
         f"📦 <b>Товар:</b> {req.cargo_description or ''}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>План:</b> {planned_date} {planned_time}\n"
-        f"✅ <b>Підтверджено:</b> {req.date.strftime('%d.%m.%Y')} {req.time}\n"
+        f"✅ <b>Підтверджено:</b> {confirmed}\n"
         f"🏁 <b>Статус завершення:</b> {final_status}"
     )
 
@@ -2133,6 +2139,7 @@ def build_admin_request_view(req: Request, is_superadmin: bool):
     final_status = "Завершена" if req.completed_at else "Не завершена"
     plan_date = req.planned_date.strftime('%d.%m.%Y') if req.planned_date else req.date.strftime('%d.%m.%Y')
     plan_time = req.planned_time if req.planned_time else req.time
+    confirmed = get_confirmed_label(req)
     text = (
         f"<b>📄 Заявка #{req.id}</b>\n"
         f"Статус: {status}\n\n"
@@ -2142,7 +2149,7 @@ def build_admin_request_view(req: Request, is_superadmin: bool):
         f"📦 <b>Товар:</b> {req.cargo_description or ''}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>План:</b> {plan_date} {plan_time}\n"
-        f"✅ <b>Підтверджено:</b> {req.date.strftime('%d.%m.%Y')} {req.time}\n"
+        f"✅ <b>Підтверджено:</b> {confirmed}\n"
         f"🏁 <b>Завершення:</b> {final_status}"
     )
     if req.pending_date and req.pending_time:
