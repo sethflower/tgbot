@@ -103,6 +103,17 @@ def parse_date_input(raw: str) -> date | None:
     except Exception:
         return None
 
+def parse_request_ids(raw: str) -> list[int] | None:
+    parts = [part.strip() for part in raw.split(",")]
+    if not parts or any(not part or not part.isdigit() for part in parts):
+        return None
+
+    request_ids = list(dict.fromkeys(int(part) for part in parts))
+    if any(request_id <= 0 for request_id in request_ids):
+        return None
+
+    return request_ids
+
 
 ROLE_LABELS = {
     "user": "Користувач",
@@ -116,6 +127,7 @@ ACTION_LABELS = {
     "request_updated": "Зміна заявки користувачем",
     "request_deleted": "Видалення заявки користувачем",
     "request_deleted_by_admin": "Видалення заявки адміністратором",
+    "requests_deleted_by_superadmin": "Видалення вибраних заявок суперадміністратором",
     "request_approved": "Підтвердження заявки адміністратором",
     "request_rejected": "Відхилення заявки адміністратором",
     "request_completed": "Завершення заявки",
@@ -137,6 +149,7 @@ ACTION_LABELS = {
 
 DETAIL_KEY_LABELS = {
     "request_id": "ID заявки",
+    "request_ids": "ID заявок",
     "reason": "Причина",
     "description": "Опис",
     "changes": "Зміни",
@@ -194,6 +207,10 @@ def build_action_description(action: str, role_label: str, details: dict[str, An
         return f"{role_label} видалив(ла) свою заявку #{rid}. Причина: {reason or 'не вказано'}."
     if action == "request_deleted_by_admin":
         return f"{role_label} видалив(ла) заявку користувача #{rid}."
+    if action == "requests_deleted_by_superadmin":
+        request_ids = d.get("request_ids", [])
+        ids_text = ", ".join(str(req_id) for req_id in request_ids)
+        return f"{role_label} видалив(ла) вибрані заявки: {ids_text}."
     if action == "request_approved":
         return f"{role_label} підтвердив(ла) заявку #{rid}."
     if action == "request_rejected":
@@ -746,6 +763,7 @@ def admin_menu(is_superadmin: bool = False):
     if is_superadmin:
         kb.button(text="➕ Додати адміна", callback_data="admin_add")
         kb.button(text="➖ Видалити адміна", callback_data="admin_remove")
+        kb.button(text="🗑 Видалити обрані заявки", callback_data="admin_delete_selected")
         kb.button(text="🗑 Очистити БД", callback_data="admin_clear")
     kb.adjust(1)
     return add_inline_navigation(kb).as_markup()
@@ -804,6 +822,9 @@ class AdminRemove(StatesGroup):
 
 class AdminSearch(StatesGroup):
     wait_id = State()
+
+class AdminDeleteSelected(StatesGroup):
+    wait_ids = State()
 
 class AdminChangeForm(StatesGroup):
     calendar = State()
@@ -2435,7 +2456,86 @@ async def admin_remove_wait(message: types.Message, state: FSMContext):
         reply_markup=navigation_keyboard(include_back=False)
     )
 
+###############################################################
+#          SUPERADMIN — DELETE SELECTED REQUESTS
+###############################################################
 
+@dp.callback_query(F.data == "admin_delete_selected")
+async def admin_delete_selected(callback: types.CallbackQuery, state: FSMContext):
+    if not await is_super_admin_user(callback.from_user.id):
+        return await callback.answer("⛔ Тільки суперадмін!", show_alert=True)
+
+    await state.set_state(AdminDeleteSelected.wait_ids)
+    await callback.message.answer(
+        "🗑 Введіть через кому ID заявок, які потрібно видалити.\n"
+        "Наприклад: <code>12, 15, 21</code>",
+        reply_markup=navigation_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.message(AdminDeleteSelected.wait_ids)
+async def admin_delete_selected_wait(message: types.Message, state: FSMContext):
+    if not await is_super_admin_user(message.from_user.id):
+        await state.clear()
+        return await message.answer(
+            "⛔ Тільки суперадмін може видаляти вибрані заявки.",
+            reply_markup=navigation_keyboard(include_back=False),
+        )
+
+    if message.text == BACK_TEXT:
+        await state.clear()
+        return await message.answer(
+            "Операцію видалення скасовано.",
+            reply_markup=admin_menu(is_superadmin=True),
+        )
+
+    request_ids = parse_request_ids(message.text or "")
+    if not request_ids:
+        return await message.answer(
+            "❌ Введіть один або кілька числових ID через кому.\n"
+            "Наприклад: <code>12, 15, 21</code>"
+        )
+
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Request).where(Request.id.in_(request_ids))
+        )
+        requests_by_id = {req.id: req for req in result.scalars().all()}
+        deleted_ids = [req_id for req_id in request_ids if req_id in requests_by_id]
+        missing_ids = [req_id for req_id in request_ids if req_id not in requests_by_id]
+
+        if deleted_ids:
+            await session.execute(delete(Request).where(Request.id.in_(deleted_ids)))
+            await session.commit()
+
+    if not deleted_ids:
+        return await message.answer(
+            "⚠️ Жодної заявки з указаними ID не знайдено. Перевірте список і спробуйте ще раз."
+        )
+
+    for req_id in deleted_ids:
+        await sheet_client.delete_request(requests_by_id[req_id])
+
+    await log_action(
+        message.from_user.id,
+        "superadmin",
+        "requests_deleted_by_superadmin",
+        {"request_ids": deleted_ids},
+    )
+
+    await state.clear()
+    deleted_text = ", ".join(str(req_id) for req_id in deleted_ids)
+    response = f"✅ Вибрані заявки видалено з бази даних: <b>{deleted_text}</b>."
+    if missing_ids:
+        missing_text = ", ".join(str(req_id) for req_id in missing_ids)
+        response += f"\n⚠️ Не знайдено: <b>{missing_text}</b>."
+
+    await message.answer(
+        response,
+        reply_markup=admin_menu(is_superadmin=True),
+    )
+    
 ###############################################################
 #                ADMIN — CLEAR DATABASE                      
 ###############################################################
