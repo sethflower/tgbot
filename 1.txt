@@ -103,6 +103,17 @@ def parse_date_input(raw: str) -> date | None:
     except Exception:
         return None
 
+def parse_request_ids(raw: str) -> list[int] | None:
+    parts = [part.strip() for part in raw.split(",")]
+    if not parts or any(not part or not part.isdigit() for part in parts):
+        return None
+
+    request_ids = list(dict.fromkeys(int(part) for part in parts))
+    if any(request_id <= 0 for request_id in request_ids):
+        return None
+
+    return request_ids
+
 
 ROLE_LABELS = {
     "user": "Користувач",
@@ -116,6 +127,7 @@ ACTION_LABELS = {
     "request_updated": "Зміна заявки користувачем",
     "request_deleted": "Видалення заявки користувачем",
     "request_deleted_by_admin": "Видалення заявки адміністратором",
+    "requests_deleted_by_superadmin": "Видалення вибраних заявок суперадміністратором",
     "request_approved": "Підтвердження заявки адміністратором",
     "request_rejected": "Відхилення заявки адміністратором",
     "request_completed": "Завершення заявки",
@@ -137,6 +149,7 @@ ACTION_LABELS = {
 
 DETAIL_KEY_LABELS = {
     "request_id": "ID заявки",
+    "request_ids": "ID заявок",
     "reason": "Причина",
     "description": "Опис",
     "changes": "Зміни",
@@ -194,6 +207,10 @@ def build_action_description(action: str, role_label: str, details: dict[str, An
         return f"{role_label} видалив(ла) свою заявку #{rid}. Причина: {reason or 'не вказано'}."
     if action == "request_deleted_by_admin":
         return f"{role_label} видалив(ла) заявку користувача #{rid}."
+    if action == "requests_deleted_by_superadmin":
+        request_ids = d.get("request_ids", [])
+        ids_text = ", ".join(str(req_id) for req_id in request_ids)
+        return f"{role_label} видалив(ла) вибрані заявки: {ids_text}."
     if action == "request_approved":
         return f"{role_label} підтвердив(ла) заявку #{rid}."
     if action == "request_rejected":
@@ -618,10 +635,13 @@ class GoogleSheetClient:
         admin_name = await get_admin_display_name(req.admin_id)
         values = self._build_row(req, admin_name)
 
-        if req.sheet_row:
-            updated = await self._update_row(req.sheet_row, values)
+        row_number = await self._get_row_number(req)
+        if row_number:
+            updated = await self._update_row(row_number, values)
             if updated:
-                return
+                if req.sheet_row != row_number:
+                    await self._store_row_number(req.id, row_number)
+            return
 
         row_number = await self._append_row(values)
         if row_number:
@@ -743,6 +763,7 @@ def admin_menu(is_superadmin: bool = False):
     if is_superadmin:
         kb.button(text="➕ Додати адміна", callback_data="admin_add")
         kb.button(text="➖ Видалити адміна", callback_data="admin_remove")
+        kb.button(text="🗑 Видалити обрані заявки", callback_data="admin_delete_selected")
         kb.button(text="🗑 Очистити БД", callback_data="admin_clear")
     kb.adjust(1)
     return add_inline_navigation(kb).as_markup()
@@ -801,6 +822,9 @@ class AdminRemove(StatesGroup):
 
 class AdminSearch(StatesGroup):
     wait_id = State()
+
+class AdminDeleteSelected(StatesGroup):
+    wait_ids = State()
 
 class AdminChangeForm(StatesGroup):
     calendar = State()
@@ -967,12 +991,18 @@ def get_status_label(status: str) -> str:
         "pending_user_final": "🟡 Очікує остаточного підтвердження",
     }.get(status, status)
 
+def get_confirmed_label(req: Request) -> str:
+    if req.status != "approved":
+        return "—"
+    return f"{req.date.strftime('%d.%m.%Y')} {req.time}"
+
 
 def format_request_text(req: Request) -> str:
     status = get_status_label(req.status)
     final_status = "Завершена" if req.completed_at else "Не завершена"
     planned_date = req.planned_date.strftime('%d.%m.%Y') if req.planned_date else req.date.strftime('%d.%m.%Y')
     planned_time = req.planned_time if req.planned_time else req.time
+    confirmed = get_confirmed_label(req)
     return (
         f"<b>📄 Заявка #{req.id}</b>\n"
         f"Статус: {status}\n"
@@ -983,7 +1013,7 @@ def format_request_text(req: Request) -> str:
         f"📦 <b>Товар:</b> {req.cargo_description or ''}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>План:</b> {planned_date} {planned_time}\n"
-        f"✅ <b>Підтверджено:</b> {req.date.strftime('%d.%m.%Y')} {req.time}\n"
+        f"✅ <b>Підтверджено:</b> {confirmed}\n"
         f"🏁 <b>Статус завершення:</b> {final_status}"
     )
 
@@ -1518,7 +1548,7 @@ async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContex
 
     prompts = {
         "supplier": (UserEditForm.supplier, "Введіть нову назву постачальника:"),
-        "phone": (UserEditForm.phone, "Введіть новий номер телефону:"),
+        "phone": (UserEditForm.phone, "Введіть новий номер телефону у форматі 380......... без знаку +:"),
         "car": (UserEditForm.car, "Введіть новий об'єм вантажу:"),
         "cargo_description": (
             UserEditForm.cargo_description,
@@ -2130,6 +2160,7 @@ def build_admin_request_view(req: Request, is_superadmin: bool):
     final_status = "Завершена" if req.completed_at else "Не завершена"
     plan_date = req.planned_date.strftime('%d.%m.%Y') if req.planned_date else req.date.strftime('%d.%m.%Y')
     plan_time = req.planned_time if req.planned_time else req.time
+    confirmed = get_confirmed_label(req)
     text = (
         f"<b>📄 Заявка #{req.id}</b>\n"
         f"Статус: {status}\n\n"
@@ -2139,7 +2170,7 @@ def build_admin_request_view(req: Request, is_superadmin: bool):
         f"📦 <b>Товар:</b> {req.cargo_description or ''}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
         f"📅 <b>План:</b> {plan_date} {plan_time}\n"
-        f"✅ <b>Підтверджено:</b> {req.date.strftime('%d.%m.%Y')} {req.time}\n"
+        f"✅ <b>Підтверджено:</b> {confirmed}\n"
         f"🏁 <b>Завершення:</b> {final_status}"
     )
     if req.pending_date and req.pending_time:
@@ -2425,7 +2456,86 @@ async def admin_remove_wait(message: types.Message, state: FSMContext):
         reply_markup=navigation_keyboard(include_back=False)
     )
 
+###############################################################
+#          SUPERADMIN — DELETE SELECTED REQUESTS
+###############################################################
 
+@dp.callback_query(F.data == "admin_delete_selected")
+async def admin_delete_selected(callback: types.CallbackQuery, state: FSMContext):
+    if not await is_super_admin_user(callback.from_user.id):
+        return await callback.answer("⛔ Тільки суперадмін!", show_alert=True)
+
+    await state.set_state(AdminDeleteSelected.wait_ids)
+    await callback.message.answer(
+        "🗑 Введіть через кому ID заявок, які потрібно видалити.\n"
+        "Наприклад: <code>12, 15, 21</code>",
+        reply_markup=navigation_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.message(AdminDeleteSelected.wait_ids)
+async def admin_delete_selected_wait(message: types.Message, state: FSMContext):
+    if not await is_super_admin_user(message.from_user.id):
+        await state.clear()
+        return await message.answer(
+            "⛔ Тільки суперадмін може видаляти вибрані заявки.",
+            reply_markup=navigation_keyboard(include_back=False),
+        )
+
+    if message.text == BACK_TEXT:
+        await state.clear()
+        return await message.answer(
+            "Операцію видалення скасовано.",
+            reply_markup=admin_menu(is_superadmin=True),
+        )
+
+    request_ids = parse_request_ids(message.text or "")
+    if not request_ids:
+        return await message.answer(
+            "❌ Введіть один або кілька числових ID через кому.\n"
+            "Наприклад: <code>12, 15, 21</code>"
+        )
+
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Request).where(Request.id.in_(request_ids))
+        )
+        requests_by_id = {req.id: req for req in result.scalars().all()}
+        deleted_ids = [req_id for req_id in request_ids if req_id in requests_by_id]
+        missing_ids = [req_id for req_id in request_ids if req_id not in requests_by_id]
+
+        if deleted_ids:
+            await session.execute(delete(Request).where(Request.id.in_(deleted_ids)))
+            await session.commit()
+
+    if not deleted_ids:
+        return await message.answer(
+            "⚠️ Жодної заявки з указаними ID не знайдено. Перевірте список і спробуйте ще раз."
+        )
+
+    for req_id in deleted_ids:
+        await sheet_client.delete_request(requests_by_id[req_id])
+
+    await log_action(
+        message.from_user.id,
+        "superadmin",
+        "requests_deleted_by_superadmin",
+        {"request_ids": deleted_ids},
+    )
+
+    await state.clear()
+    deleted_text = ", ".join(str(req_id) for req_id in deleted_ids)
+    response = f"✅ Вибрані заявки видалено з бази даних: <b>{deleted_text}</b>."
+    if missing_ids:
+        missing_text = ", ".join(str(req_id) for req_id in missing_ids)
+        response += f"\n⚠️ Не знайдено: <b>{missing_text}</b>."
+
+    await message.answer(
+        response,
+        reply_markup=admin_menu(is_superadmin=True),
+    )
+    
 ###############################################################
 #                ADMIN — CLEAR DATABASE                      
 ###############################################################
@@ -2553,7 +2663,7 @@ async def step_supplier(message: types.Message, state: FSMContext):
     await state.update_data(supplier=supplier)
 
     await message.answer(
-        "📞 <b>Крок 2/6</b>\nЗалиште контактний номер телефону:",
+        "📞 <b>Крок 2/6</b>\nЗалиште контактний номер телефону у форматі 380......... без знаку +:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.phone)
@@ -2570,7 +2680,7 @@ async def step_phone(message: types.Message, state: FSMContext):
 
     phone = message.text.strip()
     if not phone:
-        return await message.answer("⚠️ Вкажіть номер телефону для зв'язку.")
+        return await message.answer("⚠️ Вкажіть номер телефону для зв'язку у форматі 380......... без знаку +")
 
     await state.update_data(phone=phone)
 
@@ -2586,7 +2696,7 @@ async def step_car(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.phone)
         return await message.answer(
-            "📞 <b>Крок 2/6</b>\nЗалиште контактний номер телефону:",
+            "📞 <b>Крок 2/6</b>\nЗалиште контактний номер телефону у форматі 380......... без знаку + :",
             reply_markup=navigation_keyboard(),
         )
 
@@ -2773,7 +2883,7 @@ def available_minutes(
         return []
 
     # Години роботи: 09:00–16:00 з кроком 30 хвилин (00 та 30)
-    minutes = [0, 30]
+    minutes = [0] if hour == 16 else [0, 30]
 
     if earliest_dt and selected_date == earliest_dt.date():
         if hour < earliest_dt.hour:
@@ -2814,7 +2924,7 @@ def available_hours(
 def all_slots_for_day(selected_date: date) -> list[str]:
     slots: list[str] = []
     for hour in range(9, 17):
-        minutes = [0, 30]
+        minutes = [0] if hour == 16 else [0, 30]
         for minute in minutes:
             slots.append(f"{hour:02d}:{minute:02d}")
     return slots
