@@ -135,7 +135,7 @@ ACTION_LABELS = {
     "admin_added": "Додано нового адміністратора",
     "admin_removed": "Видалено адміністратора",
     "database_cleared": "Очищено всі заявки",
-    "np_delivery_submitted": "Заявка на доставку Новою поштою",
+    "np_delivery_submitted": "Заявка на доставку поштою",
     "admin_change_time": "Адміністратор запропонував новий час",
     "admin_change_confirmed": "Користувач підтвердив час адміністратора",
     "admin_change_delete": "Користувач скасував заявку після зміни",
@@ -226,7 +226,7 @@ def build_action_description(action: str, role_label: str, details: dict[str, An
     if action == "database_cleared":
         return f"{role_label} повністю очистив(ла) базу заявок."
     if action == "np_delivery_submitted":
-        return f"{role_label} подав(ла) заявку НП: постачальник {d.get('supplier', '')}, ТТН {d.get('ttn', '')}."
+        return f"{role_label} подав(ла) поштову заявку: постачальник {d.get('supplier', '')}, ТТН {d.get('ttn', '')}."
     if action == "admin_change_time":
         return f"{role_label} запропонував(ла) новий час для заявки #{rid}: {date_val} {time_val}. Причина: {reason or 'не вказано'}."
     if action == "admin_change_confirmed":
@@ -582,7 +582,7 @@ class GoogleSheetClient:
             )
             return True
         except Exception as exc:
-            logging.exception("Не вдалося додати заявку НП у Sheets: %s", exc)
+            logging.exception("Не вдалося додати заявку поштою у Sheets: %s", exc)
             return False
 
     async def _find_row_by_request_id(self, req_id: int) -> int | None:
@@ -742,7 +742,7 @@ def main_menu(show_admin: bool = False):
 def delivery_type_keyboard():
     kb = InlineKeyboardBuilder()
     kb.button(text="🚚 Доставка постачальником", callback_data="delivery_supplier")
-    kb.button(text="📦 Доставка Новою поштою", callback_data="delivery_np")
+    kb.button(text="📦 Доставка НП/TEKS/Інше", callback_data="delivery_np")
     kb.adjust(1)
     return add_inline_navigation(kb).as_markup()
 
@@ -933,7 +933,7 @@ async def delivery_np(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(NPDeliveryForm.supplier)
 
     await callback.message.answer(
-        "✉️ Введіть назву постачальника для доставки Новою поштою:",
+        "✉️ Введіть назву постачальника для доставки НП/TEKS/Інше:",
         reply_markup=navigation_keyboard()
     )
     await callback.answer()
@@ -2599,7 +2599,7 @@ async def np_supplier_step(message: types.Message, state: FSMContext):
     await state.update_data(supplier=supplier)
     await state.set_state(NPDeliveryForm.ttn)
     await message.answer(
-        "✉️ Введіть номер ТТН Нової пошти:",
+        "✉️ Введіть номер ТТН:",
         reply_markup=navigation_keyboard(),
     )
 
@@ -2609,7 +2609,7 @@ async def np_ttn_step(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(NPDeliveryForm.supplier)
         return await message.answer(
-            "✉️ Введіть назву постачальника для доставки Новою поштою:",
+            "✉️ Введіть назву постачальника для доставки НП/TEKS/Інше:",
             reply_markup=navigation_keyboard(),
         )
 
@@ -2632,7 +2632,7 @@ async def np_ttn_step(message: types.Message, state: FSMContext):
 
     if saved:
         await message.answer(
-            "✅ Заявка на доставку Новою поштою зафіксована. Адміністратори отримали повідомлення.",
+            "✅ Заявка на доставку поштою зафіксована. Адміністратори отримали повідомлення.",
             reply_markup=navigation_keyboard(include_back=False),
         )
     else:
@@ -4367,8 +4367,8 @@ async def notify_admins_np_delivery(supplier: str, ttn: str):
         admins = (await session.execute(select(Admin))).scalars().all()
 
     text = (
-        "📦 <b>НП-відправка</b>\n"
-        f"Постачальник <b>{supplier}</b> відправив посилку № {ttn}.\n"
+        "📦 <b>Поштова відправка</b>\n\n"
+        f"Постачальник <b>{supplier}</b> відправив посилку № <b>{ttn}</b>.\n\n"
         "Підтвердження не потрібне, це повідомлення лише для інформації."
     )
 
