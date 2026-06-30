@@ -170,6 +170,10 @@ DETAIL_KEY_LABELS = {
     "proposed_date": "Запропонована дата",
     "proposed_time": "Запропонований час",
     "supplier": "Постачальник",
+    "vehicle_number": "Номер авто",
+    "cargo_volume": "Об'єм вантажу",
+    "cargo_description": "Товар",
+    "loading_type": "Тип завантаження",
     "auto": "Автоматичне закриття",
     "saved_to_sheet": "Запис у Google Sheets",
     "ttn": "ТТН",
@@ -328,6 +332,7 @@ class Request(Base):
     supplier = Column(Text)
     driver_name = Column(Text)
     phone = Column(Text)
+    vehicle_number = Column(Text, nullable=True)
     car = Column(Text)
     cargo_description = Column(Text)
 
@@ -388,6 +393,8 @@ async def init_db():
                 sync_conn.execute(text("ALTER TABLE requests ADD COLUMN completed_at TIMESTAMP"))
             if "cargo_description" not in cols:
                 sync_conn.execute(text("ALTER TABLE requests ADD COLUMN cargo_description TEXT"))
+            if "vehicle_number" not in cols:
+                sync_conn.execute(text("ALTER TABLE requests ADD COLUMN vehicle_number TEXT"))
             if "pending_date" not in cols:
                 sync_conn.execute(text("ALTER TABLE requests ADD COLUMN pending_date DATE"))
             if "pending_time" not in cols:
@@ -522,13 +529,14 @@ class GoogleSheetClient:
             req.completed_at.strftime("%d.%m.%Y %H:%M") if req.completed_at else "",
             str(req.id),
             req.cargo_description or "",
+            req.vehicle_number or "",
         ]
 
     async def _update_row(self, row_number: int, values: list[str]) -> bool:
         try:
             await asyncio.to_thread(
                 self._worksheet.update,
-                f"A{row_number}:P{row_number}",
+                f"A{row_number}:Q{row_number}",
                 [values],
                 value_input_option="USER_ENTERED",
             )
@@ -665,7 +673,7 @@ class GoogleSheetClient:
             return
 
         try:
-            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:P"])
+            await asyncio.to_thread(self._worksheet.batch_clear, ["A2:Q"])
         except Exception as exc:
             logging.exception("Не вдалося очистити таблицю Sheets: %s", exc)
 
@@ -806,6 +814,7 @@ async def get_admin_display_name(admin_id: int | None) -> str:
 class QueueForm(StatesGroup):
     supplier = State()
     phone = State()
+    vehicle_number = State()
     car = State()
     cargo_description = State()
     loading_type = State()
@@ -851,6 +860,7 @@ class UserEditForm(StatesGroup):
     field_choice = State()
     supplier = State()
     phone = State()
+    vehicle_number = State()
     car = State()
     cargo_description = State()
     loading_type = State()
@@ -919,7 +929,7 @@ async def delivery_supplier(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
 
     await callback.message.answer(
-        "📦 Введіть назву постачальника:",
+        "🏢 <b>Крок 1/7</b>\nВкажіть назву постачальника:",
         reply_markup=navigation_keyboard(include_back=False)
     )
 
@@ -1008,7 +1018,8 @@ def format_request_text(req: Request) -> str:
         f"Статус: {status}\n"
         "━━━━━━━━━━━━━━━━\n"
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
-        f"📞 <b>Контакт:</b> {req.phone}\n"
+        f"📞 <b>Телефон:</b> {req.phone}\n"
+        f"🚘 <b>Номер авто:</b> {req.vehicle_number or '—'}\n"
         f"🚚 <b>Об'єм:</b> {req.car}\n"
         f"📦 <b>Товар:</b> {req.cargo_description or ''}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
@@ -1182,6 +1193,7 @@ async def notify_admins_about_user_deletion(req: Request | dict[str, Any], reaso
             "id": req.id,
             "supplier": req.supplier,
             "phone": req.phone,
+            "vehicle_number": req.vehicle_number,
             "car": req.car,
             "loading_type": req.loading_type,
             "date": req.date,
@@ -1195,6 +1207,7 @@ async def notify_admins_about_user_deletion(req: Request | dict[str, Any], reaso
         f"Причина: {reason}\n\n"
         f"📄 Дані заявки до видалення:\n"
         f"📞 {data['phone']}\n"
+        f"🚘 {data.get('vehicle_number') or '—'}\n"
         f"🚚 {data['car']}\n"
         f"🧱 {data['loading_type']}\n"
         f"📅 {data['date'].strftime('%d.%m.%Y')} ⏰ {data['time']}"
@@ -1231,6 +1244,7 @@ async def my_delete_reason(message: types.Message, state: FSMContext):
             "id": req.id,
             "supplier": req.supplier,
             "phone": req.phone,
+            "vehicle_number": req.vehicle_number,
             "car": req.car,
             "loading_type": req.loading_type,
             "date": req.date,
@@ -1290,6 +1304,7 @@ def build_user_edit_choice_keyboard():
     kb = InlineKeyboardBuilder()
     kb.button(text="🏢 Постачальник", callback_data="edit_field_supplier")
     kb.button(text="📞 Телефон", callback_data="edit_field_phone")
+    kb.button(text="🚘 Номер авто", callback_data="edit_field_vehicle_number")
     kb.button(text="🚚 Об'єм", callback_data="edit_field_car")
     kb.button(text="📦 Товар", callback_data="edit_field_cargo_description")
     kb.button(text="🧱 Тип завантаження", callback_data="edit_field_loading")
@@ -1441,6 +1456,35 @@ async def user_edit_phone(message: types.Message, state: FSMContext):
     )
 
 
+@dp.message(UserEditForm.vehicle_number)
+async def user_edit_vehicle_number(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(UserEditForm.field_choice)
+        return await message.answer(
+            "Оберіть, що потрібно змінити у заявці:",
+            reply_markup=build_user_edit_choice_keyboard(),
+        )
+
+    value = message.text.strip()
+    if not value:
+        return await message.answer("Номер авто не може бути порожнім.")
+
+    req, reason = await _load_request_for_edit(state, message.from_user.id)
+    if not req:
+        return await message.answer("Заявка не знайдена або вам не належить.")
+
+    old_value = req.vehicle_number or ""
+    req.vehicle_number = value
+    await finalize_user_edit_update(
+        message,
+        state,
+        req,
+        reason or "",
+        text=f"Поле 'Номер авто' оновлено для заявки #{req.id}.",
+        changes=[("Номер авто", old_value, req.vehicle_number)],
+    )
+
+
 @dp.message(UserEditForm.car)
 async def user_edit_car(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
@@ -1549,6 +1593,7 @@ async def user_edit_field_choice(callback: types.CallbackQuery, state: FSMContex
     prompts = {
         "supplier": (UserEditForm.supplier, "Введіть нову назву постачальника:"),
         "phone": (UserEditForm.phone, "Введіть новий номер телефону у форматі 380......... без знаку +:"),
+        "vehicle_number": (UserEditForm.vehicle_number, "Введіть новий номер авто:"),
         "car": (UserEditForm.car, "Введіть новий об'єм вантажу:"),
         "cargo_description": (
             UserEditForm.cargo_description,
@@ -2166,6 +2211,7 @@ def build_admin_request_view(req: Request, is_superadmin: bool):
         f"Статус: {status}\n\n"
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
         f"📞 <b>Телефон:</b> {req.phone}\n"
+        f"🚘 <b>Номер авто:</b> {req.vehicle_number or '—'}\n"
         f"🚚 <b>Об'єм:</b> {req.car}\n"
         f"📦 <b>Товар:</b> {req.cargo_description or ''}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
@@ -2663,7 +2709,7 @@ async def step_supplier(message: types.Message, state: FSMContext):
     await state.update_data(supplier=supplier)
 
     await message.answer(
-        "📞 <b>Крок 2/6</b>\nЗалиште контактний номер телефону у форматі 380......... без знаку +:",
+        "📞 <b>Крок 2/7</b>\nЗалиште контактний номер телефону у форматі 380......... без знаку +:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.phone)
@@ -2674,7 +2720,7 @@ async def step_phone(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.supplier)
         return await message.answer(
-            "🏢 <b>Крок 1/6</b>\nВкажіть назву постачальника:",
+            "🏢 <b>Крок 1/7</b>\nВкажіть назву постачальника:",
             reply_markup=navigation_keyboard(include_back=False)
         )
 
@@ -2685,7 +2731,29 @@ async def step_phone(message: types.Message, state: FSMContext):
     await state.update_data(phone=phone)
 
     await message.answer(
-        "🚚 <b>Крок 3/6</b>\nВкажіть об'єм вантажу:",
+        "🚘 <b>Крок 3/7</b>\nВкажіть номер авто:",
+        reply_markup=navigation_keyboard()
+    )
+    await state.set_state(QueueForm.vehicle_number)
+
+
+@dp.message(QueueForm.vehicle_number)
+async def step_vehicle_number(message: types.Message, state: FSMContext):
+    if message.text == BACK_TEXT:
+        await state.set_state(QueueForm.phone)
+        return await message.answer(
+            "📞 <b>Крок 2/7</b>\nЗалиште контактний номер телефону у форматі 380......... без знаку +:",
+            reply_markup=navigation_keyboard(),
+        )
+
+    vehicle_number = message.text.strip()
+    if not vehicle_number:
+        return await message.answer("⚠️ Вкажіть номер авто.")
+
+    await state.update_data(vehicle_number=vehicle_number)
+
+    await message.answer(
+        "🚚 <b>Крок 4/7</b>\nВкажіть об'єм вантажу:",
         reply_markup=navigation_keyboard()
     )
     await state.set_state(QueueForm.car)
@@ -2694,9 +2762,9 @@ async def step_phone(message: types.Message, state: FSMContext):
 @dp.message(QueueForm.car)
 async def step_car(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
-        await state.set_state(QueueForm.phone)
+        await state.set_state(QueueForm.vehicle_number)
         return await message.answer(
-            "📞 <b>Крок 2/6</b>\nЗалиште контактний номер телефону у форматі 380......... без знаку + :",
+            "🚘 <b>Крок 3/7</b>\nВкажіть номер авто:",
             reply_markup=navigation_keyboard(),
         )
 
@@ -2707,7 +2775,7 @@ async def step_car(message: types.Message, state: FSMContext):
     await state.update_data(car=car)
 
     await message.answer(
-        "📦 <b>Крок 4/6</b>\nВкажіть товар, який доставляється:",
+        "📦 <b>Крок 5/7</b>\nВкажіть товар, який доставляється:",
         reply_markup=navigation_keyboard(),
     )
 
@@ -2719,7 +2787,7 @@ async def step_cargo_description(message: types.Message, state: FSMContext):
     if message.text == BACK_TEXT:
         await state.set_state(QueueForm.car)
         return await message.answer(
-            "🚚 <b>Крок 3/6</b>\nВкажіть об'єм вантажу:",
+            "🚚 <b>Крок 4/7</b>\nВкажіть об'єм вантажу:",
             reply_markup=navigation_keyboard(),
         )
 
@@ -2735,7 +2803,7 @@ async def step_cargo_description(message: types.Message, state: FSMContext):
     kb.adjust(1)
 
     await message.answer(
-        "⚙️ <b>Крок 5/6</b>\nОберіть тип завантаження:",
+        "⚙️ <b>Крок 6/7</b>\nОберіть тип завантаження:",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_cargo").as_markup(),
     )
 
@@ -2746,7 +2814,7 @@ async def step_cargo_description(message: types.Message, state: FSMContext):
 async def loading_back(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(QueueForm.cargo_description)
     await callback.message.answer(
-        "📦 <b>Крок 4/6</b>\nВкажіть товар, який доставляється:",
+        "📦 <b>Крок 5/7</b>\nВкажіть товар, який доставляється:",
         reply_markup=navigation_keyboard(),
     )
     await callback.answer()
@@ -2768,7 +2836,7 @@ async def step_loading(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(loading_type=t, min_plan_dt=min_dt.isoformat())
 
     await callback.message.answer(
-        "📅 <b>Крок 6/6</b>\nОберіть дату та час візиту:",
+        "📅 <b>Крок 7/7</b>\nОберіть дату та час візиту:",
         reply_markup=build_date_calendar(
             back_callback="back_to_loading", hide_sundays=True, min_date=min_dt.date()
         )
@@ -2974,7 +3042,7 @@ async def cal_back_to_loading(callback: types.CallbackQuery, state: FSMContext):
 
     await state.set_state(QueueForm.loading_type)
     await callback.message.answer(
-        "🔹 Оберіть тип завантаження:",
+        "⚙️ <b>Крок 6/7</b>\nОберіть тип завантаження:",
         reply_markup=add_inline_navigation(kb, back_callback="back_to_cargo").as_markup()
     )
     await callback.answer()
@@ -3051,7 +3119,7 @@ async def back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
 
     await state.set_state(QueueForm.calendar)
     await callback.message.answer(
-        "📅 <b>Крок 6/6</b>\nОберіть дату та час візиту:", reply_markup=markup
+        "📅 <b>Крок 7/7</b>\nОберіть дату та час візиту:", reply_markup=markup
     )
     await callback.answer()
 
@@ -3120,6 +3188,7 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
             user_id=callback.from_user.id,
             supplier=data["supplier"],
             phone=data["phone"],
+            vehicle_number=data["vehicle_number"],
             car=data["car"],
             cargo_description=data["cargo_description"],
             loading_type=data["loading_type"],
@@ -3143,6 +3212,11 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
         {
             "request_id": req.id,
             "supplier": req.supplier,
+            "phone": req.phone,
+            "vehicle_number": req.vehicle_number,
+            "cargo_volume": req.car,
+            "cargo_description": req.cargo_description,
+            "loading_type": req.loading_type,
             "planned_date": str(req.planned_date),
             "planned_time": req.planned_time,
         },
@@ -3196,7 +3270,8 @@ async def broadcast_new_request(req_id: int):
         f"<b>🆕 Нова заявка #{req.id}</b>\n"
         "━━━━━━━━━━━━━━━━\n"
         f"🏢 <b>Постачальник:</b> {req.supplier}\n"
-        f"📞 <b>Контакт:</b> {req.phone}\n"
+        f"📞 <b>Телефон:</b> {req.phone}\n"
+        f"🚘 <b>Номер авто:</b> {req.vehicle_number or '—'}\n"
         f"🚚 <b>Об'єм:</b> {req.car}\n"
         f"📦 <b>Товар:</b> {req.cargo_description or ''}\n"
         f"🧱 <b>Тип завантаження:</b> {req.loading_type}\n"
@@ -4349,6 +4424,8 @@ async def notify_admins_about_action(req: Request, action: str, *, reason: str |
         f"ℹ️ <b>Заявка #{req.id} {action}</b>\n\n"
         f"📅 {req.date.strftime('%d.%m.%Y')}  ⏰ {req.time}\n"
         f"🏢 {req.supplier}\n"
+        f"📞 {req.phone}\n"
+        f"🚘 {req.vehicle_number or '—'}\n"
         f"🚚 {req.car}\n"
         f"🧱 {req.loading_type}\n"
         f"🏁 {final_status}"
@@ -4394,6 +4471,7 @@ async def notify_admins_about_user_edit(
         f"Потрібно повторно підтвердити/відхилити або скоригувати дату чи час.\n"
         f"📅 {req.date.strftime('%d.%m.%Y')} ⏰ {req.time}\n"
         f"📞 {req.phone}\n"
+        f"🚘 {req.vehicle_number or '—'}\n"
         f"🚚 {req.car}\n\n"
         f"Що змінено:\n{changes_text}"
     )
