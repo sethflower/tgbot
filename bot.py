@@ -3027,7 +3027,7 @@ async def logs_end_date(message: types.Message, state: FSMContext):
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-        writer.writerow(["ID", "Дата/час", "Actor ID", "Роль", "Дія", "Деталі"])
+    writer.writerow(["ID", "Дата/час", "Actor ID", "Роль", "Дія", "Деталі"])
     for lg in logs:
         writer.writerow([
             lg.id,
